@@ -205,17 +205,30 @@ bool AutoMaskInteract::draw(const OFX::DrawArgs& args)
             }
         }
 
+        // The live count, drawn rather than written to the read-out parameter.
+        //
+        // The parameter cannot carry this: it can only be written from
+        // changedParam, which runs BEFORE the render that produces the new
+        // analysis, so it is always one edit behind. Here the segmentation is
+        // in hand and the number is true.
+        {
+            char msg[128];
+            if (seg->count() > kMaxOutlines && p->ShowAllElements())
+                std::snprintf(msg, sizeof(msg), "%d elements, %d selected  (too many to outline)",
+                              seg->count(), sel.selectedCount);
+            else if (sel.unresolvedCount > 0)
+                std::snprintf(msg, sizeof(msg), "%d elements, %d selected, %d point(s) hit nothing",
+                              seg->count(), sel.selectedCount, sel.unresolvedCount);
+            else
+                std::snprintf(msg, sizeof(msg), "%d elements, %d selected", seg->count(),
+                              sel.selectedCount);
+            SetColour(c, 0.85f, 0.85f, 0.85f, 0.9f);
+            DrawText(c, msg, c.toCanonical(0.02, 0.97), kOfxDrawTextAlignmentLeft);
+        }
+
         if (p->ShowAllElements())
         {
-            if (seg->count() > kMaxOutlines)
-            {
-                char msg[96];
-                std::snprintf(msg, sizeof(msg), "%d elements - too many to outline",
-                              seg->count());
-                SetColour(c, 0.85f, 0.85f, 0.85f, 0.9f);
-                DrawText(c, msg, c.toCanonical(0.02, 0.97), kOfxDrawTextAlignmentLeft);
-            }
-            else
+            if (seg->count() <= kMaxOutlines)
             {
                 SetColour(c, 0.85f, 0.85f, 0.85f, 0.9f);
                 for (int l = 1; l <= seg->count(); ++l)

@@ -310,7 +310,12 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     BandRenderer renderer(srcView, dstView, plane, cp, window);
     renderer.multiThread();
 
-    updateStatus();
+    // Deliberately NOT updating the status read-out here. Writing a parameter
+    // from render is forbidden -- render runs on the host's worker threads,
+    // outside any edit block, and a host that dispatches the resulting
+    // changedParam back onto one of them deadlocks against the cache mutex this
+    // function is already holding the result of. The read-out is refreshed from
+    // changedParam instead, which is the only place a write is legal.
 }
 
 // -------------------------------------------------------------- changedParam
@@ -721,7 +726,11 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
         showAll->setParent(*g);
         AddParamUI(page, showAll);
 
-        DefineReadout(p_Desc, page, g, kParamElementStatus, "Elements",
+        // Refreshed from changedParam, which runs before the render that
+        // produces the new analysis -- so after a threshold change this shows
+        // the previous count until the next edit. The viewer overlay draws the
+        // live figure; this exists for when the overlay is switched off.
+        DefineReadout(p_Desc, page, g, kParamElementStatus, "Elements (last)",
                       "No analysis yet - step a frame first.");
     }
 
