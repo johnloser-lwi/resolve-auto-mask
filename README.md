@@ -81,17 +81,30 @@ decides what joins to what.
 
 | Output | What you get |
 |---|---|
+| **Preview** *(default)* | Selection at full strength over a dimmed copy of the rest |
 | Matte | Black-and-white mask, to drive something downstream |
 | Cutout | Original colour, everything unselected knocked out |
 | Cutout (Premultiplied) | The same, already multiplied by the mask |
 | Composite | The whole frame, with the selection moved within it |
 
-**Transform** — `Position`, `Scale` / `Scale Y` / `Link Scale`, `Rotation`,
-`Anchor`, `Anchor to Selection`, `Filter`. Set Output to **Composite** to see
-the selection move within the picture rather than on its own.
+**Preview is the default on purpose.** Every other mode hides what is not
+selected, so on a fresh instance — nothing selected yet — they all show a blank
+frame and there is nothing to aim at. It is a mode rather than a hidden
+checkbox precisely so the Output control always says what you are looking at:
+a preview toggle you can forget is on is worse than no preview at all.
 
-*Anchor to Selection* is worth knowing about: the default anchor is the centre
-of frame, which is almost never the right pivot for rotating one element.
+**Transform** — `Position`, `Scale` / `Scale Y` / `Link Scale`, `Rotation`,
+`Anchor`, `Anchor to Selection`, `Auto Center`, `Filter`. Set Output to
+**Composite** to see the selection move within the picture rather than on its
+own.
+
+Two buttons worth knowing about:
+
+- *Anchor to Selection* — the default anchor is the centre of frame, which is
+  almost never the right pivot for rotating one element.
+- *Auto Center* — sets Position so the selection sits in the middle of frame.
+  It measures the element **as it currently appears**, so it is correct with a
+  scale and a rotation already applied, and it writes Position only.
 
 ---
 
@@ -153,6 +166,15 @@ The obvious formulation, `Ew + B*(1-Aw)`, is wrong at identity: substituting
 `M = 0.5`. That reads as a dark ring along every feathered edge with the
 transform doing nothing at all. The `identity_composite` test exists to catch
 exactly this, and it runs *with* a feather because a hard mask hides the bug.
+
+**Auto Center scans pixels rather than transforming a bounding box.** The
+obvious implementation solves `T(c) == centre` for the bounding-box centre `c`.
+That is right only while the transform is axis-aligned: rotate the element and
+the image of the old box centre is no longer the centre of the new box — for a
+triangle at 35° it is off by tens of pixels, which reads as a button that
+simply does not work. `core/AutoCenter.h` measures the transformed extent of
+the actual selected pixels instead. The `auto_center_transformed` test exists
+because `auto_center` alone cannot tell the two apart, and caught exactly this.
 
 **There is no CUDA path, on purpose.** Labeling is inherently serial and is
 cached per content-hash, so it runs once per content change rather than once

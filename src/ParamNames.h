@@ -39,6 +39,7 @@ constexpr const char* kParamXfLink         = "xformScaleLink";
 constexpr const char* kParamXfRot          = "xformRotation";
 constexpr const char* kParamXfAnchor       = "xformAnchor";
 constexpr const char* kParamAnchorToSel    = "anchorToSelection";
+constexpr const char* kParamAutoCenter     = "autoCenter";
 constexpr const char* kParamFilter         = "filterMode";
 
 // --- About -------------------------------------------------------------------

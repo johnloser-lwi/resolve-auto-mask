@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "core/AutoCenter.h"
 #include "core/Composite.h"
 #include "core/MaskBuild.h"
 #include "core/Segmentation.h"
@@ -40,6 +41,8 @@ struct Options {
   bool stats = false;
   int expect = -1;
   bool identityCheck = false;
+  bool autoCenter = false;
+  bool centerCheck = false;
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -94,7 +97,8 @@ Options parseArgs(int argc, char** argv) {
       else if (eq(v, "cutout")) o.outputMode = am::kOutCutout;
       else if (eq(v, "cutoutpm")) o.outputMode = am::kOutCutoutPM;
       else if (eq(v, "composite")) o.outputMode = am::kOutComposite;
-      else die("--output must be matte|cutout|cutoutpm|composite");
+      else if (eq(v, "preview")) o.outputMode = am::kOutPreview;
+      else die("--output must be matte|cutout|cutoutpm|composite|preview");
     } else if (eq(a, "--leave-original")) {
       o.bgMode = am::kBgLeft;
     } else if (eq(a, "--invert-mask")) {
@@ -121,6 +125,10 @@ Options parseArgs(int argc, char** argv) {
       o.expect = std::atoi(next());
     } else if (eq(a, "--identity-check")) {
       o.identityCheck = true;
+    } else if (eq(a, "--auto-center")) {
+      o.autoCenter = true;
+    } else if (eq(a, "--center-check")) {
+      o.centerCheck = true;
     } else {
       die(std::string("unknown option ") + a);
     }
@@ -250,14 +258,26 @@ int main(int argc, char** argv) {
   // testing a different convention from the one that ships. Positive Y is up
   // here for the same reason it is up there.
   const float w = float(seg.width), h = float(seg.height);
+
+  float posX = o.posX, posY = o.posY;
+  if (o.autoCenter) {
+    double cpx = 0.0, cpy = 0.0;
+    if (!am::CenterOffsetForSelection(seg, sel, o.scaleX, o.scaleY, o.rot, o.anchorX, o.anchorY,
+                                      cpx, cpy))
+      die("--auto-center with nothing selected");
+    posX = float(cpx);
+    posY = float(cpy);
+    if (o.stats) std::printf("  auto-center position: %.5f, %.5f\n", cpx, cpy);
+  }
+
   am::CompositeParams cp;
   cp.outputMode = o.outputMode;
   cp.backgroundMode = o.bgMode;
   cp.filter = o.filter;
-  cp.identity = am::TransformIsIdentity(o.posX, o.posY, o.scaleX, o.scaleY, o.rot);
+  cp.identity = am::TransformIsIdentity(posX, posY, o.scaleX, o.scaleY, o.rot);
   if (!cp.identity)
-    cp.inv = mtx::Invert(am::MakeElementTransform(w, h, o.posX, o.posY, o.scaleX, o.scaleY,
-                                                  o.rot, o.anchorX, o.anchorY));
+    cp.inv = mtx::Invert(am::MakeElementTransform(w, h, posX, posY, o.scaleX, o.scaleY, o.rot,
+                                                  o.anchorX, o.anchorY));
 
   const am::PlaneView plane{mask.data(), seg.width, seg.height};
   std::vector<float> out(std::size_t(seg.width) * seg.height * 4, 0.0f);
@@ -276,6 +296,35 @@ int main(int argc, char** argv) {
     std::printf("identity max abs difference: %.9g\n", double(worst));
     if (worst > 1e-6f) {
       std::fprintf(stderr, "masktest: identity composite is not a no-op (%.9g)\n", double(worst));
+      return 1;
+    }
+  }
+
+  // Auto Center claims to put the BOUNDING BOX centre on the frame centre --
+  // not the centroid, which for a triangle is a third of the way up and would
+  // make the button look broken. So measure the bounding box of what actually
+  // came out, and check that.
+  if (o.centerCheck) {
+    int x1 = seg.width, y1 = seg.height, x2 = 0, y2 = 0;
+    for (int y = 0; y < seg.height; ++y)
+      for (int x = 0; x < seg.width; ++x) {
+        if (out[(std::size_t(y) * seg.width + x) * 4 + 3] <= 0.5f) continue;
+        x1 = std::min(x1, x);
+        y1 = std::min(y1, y);
+        x2 = std::max(x2, x + 1);
+        y2 = std::max(y2, y + 1);
+      }
+    if (x2 <= x1) {
+      std::fprintf(stderr, "masktest: --center-check found nothing in the output\n");
+      return 1;
+    }
+    const double dx = (x1 + x2) * 0.5 - seg.width * 0.5;
+    const double dy = (y1 + y2) * 0.5 - seg.height * 0.5;
+    std::printf("centred to within %.3f, %.3f px\n", dx, dy);
+    // A pixel and a half: the resampled edge gains a fraction of a pixel on
+    // each side, and a half-covered edge pixel can tip either way.
+    if (std::fabs(dx) > 1.5 || std::fabs(dy) > 1.5) {
+      std::fprintf(stderr, "masktest: not centred (%.3f, %.3f px off)\n", dx, dy);
       return 1;
     }
   }

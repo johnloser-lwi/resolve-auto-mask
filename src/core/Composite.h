@@ -12,8 +12,23 @@ enum OutputMode {
   kOutMatte = 0,      ///< the mask itself, as a greyscale/alpha image
   kOutCutout = 1,     ///< source colour, source alpha gated by the mask
   kOutCutoutPM = 2,   ///< premultiplied: the element layer, nothing else
-  kOutComposite = 3   ///< the whole frame, with the element moved within it
+  kOutComposite = 3,  ///< the whole frame, with the element moved within it
+
+  /// Selected elements at full strength over a dimmed copy of everything else.
+  ///
+  /// Appended rather than inserted, and deliberately a mode rather than a
+  /// separate toggle. Every other output hides whatever is not selected, so
+  /// before the first click the frame is blank and there is nothing to aim at
+  /// -- you are picking elements you cannot see. A hidden "preview" checkbox
+  /// would fix that and introduce a worse problem: state that changes the
+  /// render and is easy to leave on. As a mode, the Output control always says
+  /// what you are looking at.
+  kOutPreview = 4
 };
+
+/// How much of the unselected frame survives in Preview. Enough to aim at,
+/// far enough down that the selection is unmistakable.
+constexpr float kPreviewDim = 0.3f;
 
 enum BackgroundMode {
   kBgRemoved = 0,  ///< a transparent hole where the element used to be
@@ -55,6 +70,16 @@ inline mtx::Mat3 MakeElementTransform(float w, float h, double posX, double posY
                                       double anchorY) {
   return mtx::MakeTransform(float(anchorX) * w, float(1.0 - anchorY) * h, float(scaleX),
                             float(scaleY), float(-rotDeg), float(posX) * w, float(-posY) * h);
+}
+
+/// The linear part of the element transform: rotation and scale about the
+/// anchor, with no translation. Split out because Auto Center needs to apply it
+/// on its own, and rebuilding it there by hand is how the two would drift apart.
+inline mtx::Mat3 ElementLinearPart(double scaleX, double scaleY, double rotDeg) {
+  // The same negated rotation MakeElementTransform uses, for the same reason:
+  // the user's degrees turn counter-clockwise on screen, and core's y runs down.
+  return mtx::Mat3::Rotate(float(-rotDeg)) *
+         mtx::Mat3::Scale(float(scaleX), float(scaleY));
 }
 
 /// Fetch the element layer (source premultiplied by the mask) and the mask
@@ -161,6 +186,13 @@ MTX_HD inline void RenderPixel(const ImageView& src, const PlaneView& mask,
       out[1] = Sw[1];
       out[2] = Sw[2];
       out[3] = Sw[3] * Aw;
+      return;
+
+    case kOutPreview:
+      // The selection as it will actually look, over a ghost of the rest so
+      // there is something to click. Not hole-aware: this is an aiming aid, and
+      // seeing where an element came from is useful while placing it.
+      for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * kPreviewDim;
       return;
 
     case kOutComposite:

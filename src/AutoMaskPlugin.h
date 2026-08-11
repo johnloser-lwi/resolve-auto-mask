@@ -69,6 +69,10 @@ private:
     /// Reads the segmentation controls at @p time into a DetectParams.
     am::DetectParams DetectParamsAt(double time) const;
 
+    /// Bounding box of everything currently selected, in top-down pixels.
+    /// Returns false when nothing is selected or nothing has been analysed.
+    bool SelectionBounds(double time, const am::Segmentation& seg, am::RectI& out) const;
+
     /// One place, one pass, for every visibility rule. Never called from render.
     void syncVisibility();
 
@@ -104,6 +108,7 @@ private:
     OFX::DoubleParam*   _xfRot    = nullptr;
     OFX::Double2DParam* _xfAnchor = nullptr;
     OFX::PushButtonParam* _anchorToSel = nullptr;
+    OFX::PushButtonParam* _autoCenter  = nullptr;
     OFX::ChoiceParam*   _filter   = nullptr;
 
     mutable am::AnalysisCache _cache;

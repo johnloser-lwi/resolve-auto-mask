@@ -137,6 +137,21 @@ add_test(NAME identity_composite
          COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/identity.png"
                  --select-all --output composite --feather 8 --identity-check)
 
+# Auto Center, on the triangle -- deliberately, because its bounding-box centre
+# and its centroid are nowhere near each other, so a version that centred the
+# wrong one would pass on the circle and fail here.
+add_test(NAME auto_center
+         COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/centered.png"
+                 --select "0.34,0.79" --output cutoutpm --auto-center --center-check)
+
+# And again with a scale and a rotation in force. Solving for the translation
+# without accounting for those is right only at scale 1 / rotation 0, which is
+# exactly the case the simple test above cannot distinguish.
+add_test(NAME auto_center_transformed
+         COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/centered_xf.png"
+                 --select "0.34,0.79" --output cutoutpm --scale 1.6,0.7 --rot 35
+                 --anchor 0.2,0.2 --auto-center --center-check)
+
 # --- Assemble the .ofx.bundle ------------------------------------------------
 # Per-config path: with a multi-config generator a single shared bundle dir means
 # a Debug build silently overwrites the Release one, and the install scripts

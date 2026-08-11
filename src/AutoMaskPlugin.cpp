@@ -12,6 +12,7 @@
 #include "HostProbe.h"
 #include "ParamNames.h"
 #include "ParamRegistry.h"
+#include "core/AutoCenter.h"
 #include "core/Composite.h"
 #include "core/MaskBuild.h"
 #include "core/Segmentation.h"
@@ -170,6 +171,7 @@ AutoMaskPlugin::AutoMaskPlugin(OfxImageEffectHandle p_Handle)
     _xfRot       = fetchDoubleParam(kParamXfRot);
     _xfAnchor    = fetchDouble2DParam(kParamXfAnchor);
     _anchorToSel = fetchPushButtonParam(kParamAnchorToSel);
+    _autoCenter  = fetchPushButtonParam(kParamAutoCenter);
     _filter      = fetchChoiceParam(kParamFilter);
 
     // The published documentation for Resolve's OFX host is thin and partly
@@ -190,6 +192,17 @@ am::DetectParams AutoMaskPlugin::DetectParamsAt(double time) const
     d.minElementSize = IntAt(_minElementSize, time);
     d.bridgeRadius = IntAt(_bridgeGaps, time);
     return d;
+}
+
+bool AutoMaskPlugin::SelectionBounds(double /*time*/, const Segmentation& seg, RectI& out) const
+{
+    if (seg.empty()) return false;
+
+    const Resolved sel = ResolveSelection(seg, ParseAnchors(StringOf(_selectedPoints)));
+    out = RectI{};
+    for (int l = 1; l <= seg.count(); ++l)
+        if (sel.labelSelected[std::size_t(l)]) out.unionWith(seg.components[std::size_t(l)].bbox);
+    return !out.empty();
 }
 
 std::shared_ptr<const am::Segmentation> AutoMaskPlugin::CurrentSegmentation() const
@@ -357,27 +370,50 @@ void AutoMaskPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args,
             return;
         }
 
-        if (p_ParamName == kParamAnchorToSel)
+        if (p_ParamName == kParamAnchorToSel || p_ParamName == kParamAutoCenter)
         {
             std::shared_ptr<const Segmentation> seg = CurrentSegmentation();
-            if (!seg || seg->empty()) return;
-
-            const Resolved sel = ResolveSelection(*seg, ParseAnchors(StringOf(_selectedPoints)));
             RectI box;
-            for (int l = 1; l <= seg->count(); ++l)
-                if (sel.labelSelected[std::size_t(l)])
-                    box.unionWith(seg->components[std::size_t(l)].bbox);
-            if (box.empty()) return;
+            if (!seg || !SelectionBounds(p_Args.time, *seg, box))
+            {
+                if (_elementStatus)
+                    _elementStatus->setValue(
+                        seg && !seg->empty() ? "Nothing selected." : "No analysis yet.");
+                return;
+            }
 
-            // Back to normalized, and back to the host's y-up convention. The
-            // default anchor is the centre of frame, which is the wrong pivot
-            // for rotating one element; reading the bbox centre off the viewer
-            // by hand is miserable, so this does it.
-            const double cx = (box.x1 + box.x2) * 0.5 / double(seg->width);
-            const double cyTopDown = (box.y1 + box.y2) * 0.5 / double(seg->height);
+            const double cxPx = (box.x1 + box.x2) * 0.5;
+            const double cyPx = (box.y1 + box.y2) * 0.5;
 
-            EditBlock eb(this, "Anchor to Selection");
-            if (_xfAnchor) _xfAnchor->setValue(cx, 1.0 - cyTopDown);
+            if (p_ParamName == kParamAnchorToSel)
+            {
+                // Back to normalized and back to the host's y-up convention. The
+                // default anchor is the centre of frame, which is the wrong pivot
+                // for rotating one element.
+                EditBlock eb(this, "Anchor to Selection");
+                if (_xfAnchor)
+                    _xfAnchor->setValue(cxPx / double(seg->width),
+                                        1.0 - cyPx / double(seg->height));
+                return;
+            }
+
+            // Auto Center. Writes Position and nothing else, so the framing is
+            // still yours to nudge afterwards.
+            double ax = 0.5, ay = 0.5;
+            Double2DAt(_xfAnchor, p_Args.time, ax, ay);
+            const double sx = DoubleAt(_xfScale, p_Args.time);
+            const double sy = BoolAt(_xfLink, p_Args.time) ? sx
+                                                           : DoubleAt(_xfScaleY, p_Args.time);
+            const double rot = DoubleAt(_xfRot, p_Args.time);
+
+            const Resolved sel =
+                ResolveSelection(*seg, ParseAnchors(StringOf(_selectedPoints)));
+
+            double posX = 0.0, posY = 0.0;
+            if (!CenterOffsetForSelection(*seg, sel, sx, sy, rot, ax, ay, posX, posY)) return;
+
+            EditBlock eb(this, "Auto Center");
+            if (_xfPos) _xfPos->setValue(posX, posY);
             return;
         }
 
@@ -766,16 +802,24 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
         OFX::ChoiceParamDescriptor* out = p_Desc.defineChoiceParam(kParamOutputMode);
         out->setLabels("Output", "Output", "Output");
         out->setHint(
-            "Matte gives a black-and-white mask to drive something downstream. Cutout keeps "
-            "the original colour and knocks out everything unselected. Cutout "
+            "Preview shows the selection at full strength over a dimmed copy of the rest, so "
+            "you can see what you are clicking. Switch to one of the others when you are "
+            "done. Matte gives a black-and-white mask to drive something downstream. Cutout "
+            "keeps the original colour and knocks out everything unselected. Cutout "
             "(Premultiplied) is the same already multiplied by the mask, for compositing "
             "straight on top of another layer. Composite keeps the whole frame and moves the "
             "selection within it, which is the one to use with the Transform below.");
+        // Appended, never inserted: the host stores the index, so adding an
+        // option in the middle would reinterpret every project already saved.
         out->appendOption("Matte");
         out->appendOption("Cutout");
         out->appendOption("Cutout (Premultiplied)");
         out->appendOption("Composite");
-        out->setDefault(kOutMatte);
+        out->appendOption("Preview");
+        // Preview is the default because every other mode hides what is not
+        // selected -- so on a fresh instance, with nothing selected yet, they
+        // all show a blank frame and there is nothing to click.
+        out->setDefault(kOutPreview);
         out->setAnimates(false);
         out->setParent(*g);
         AddParam(page, out);
@@ -839,6 +883,12 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
 
         DefineButton(p_Desc, page, g, kParamAnchorToSel, "Anchor to Selection",
                      "Moves the Anchor to the centre of whatever is currently selected.");
+
+        DefineButton(p_Desc, page, g, kParamAutoCenter, "Auto Center",
+                     "Sets Position so the selected elements sit in the middle of the frame. "
+                     "Takes the current Scale and Rotation into account, so it centres the "
+                     "element as it actually appears rather than as it started. Writes "
+                     "Position only -- everything else is left where you put it.");
 
         OFX::ChoiceParamDescriptor* filt = p_Desc.defineChoiceParam(kParamFilter);
         filt->setLabels("Filter", "Filter", "Filter");
