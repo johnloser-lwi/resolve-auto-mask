@@ -1,0 +1,33 @@
+# Build output. The bundle, the CMake cache and the generated VS project all
+# live here, so this one line covers everything the build produces.
+build/
+out/
+
+# Contact sheets rendered into the repo root by running linetest from here.
+# Deliberately root-only rather than *.png: ignoring PNGs everywhere would
+# silently swallow a documentation image someone later adds under docs/, and
+# a file that refuses to be committed without saying so is a bad trap to leave.
+/*.png
+
+# Visual Studio / MSBuild
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.aps
+
+# CMake
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+
+# Logs. The probe log lives in %LOCALAPPDATA%\BetterLine and never lands here,
+# but build transcripts sometimes do.
+*.log
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
