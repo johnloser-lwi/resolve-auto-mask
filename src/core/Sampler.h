@@ -30,6 +30,15 @@ MTX_HD inline int WrapCoord(int v, int n, EdgeMode mode, bool& outside) {
   return v < 0 ? 0 : n - 1;  // kEdgeBlack: the caller discards via `outside`
 }
 
+/// Is the 2x2 bilinear footprint at (x0,y0) entirely inside the image?
+///
+/// Worth asking once per sample rather than four times: it is true for all but
+/// a one-pixel border, and it lets the four fetches skip their bounds tests
+/// entirely. At UHD that is ~8.3 million branch pairs per frame not taken.
+MTX_HD inline bool FootprintInside(int x0, int y0, int w, int h) {
+  return x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h;
+}
+
 /// Fetch one RGBA texel, honouring the edge mode. Writes 4 channels into `out`.
 MTX_HD inline void FetchTexel(const ImageView& img, int x, int y, EdgeMode mode, float* out) {
   bool outside = false;

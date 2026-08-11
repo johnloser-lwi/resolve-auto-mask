@@ -1,4 +1,4 @@
-// Host-independent views over a premultiplied float RGBA buffer.
+﻿// Host-independent views over a premultiplied float RGBA buffer.
 //
 // Everything under src/core works in terms of these, which is what lets the
 // identical segmentation and compositing code run inside Resolve and inside
@@ -8,14 +8,29 @@
 #include <cstddef>
 #include <cstdint>
 
+// These accessors are called from inside the CUDA kernel, so they have to be
+// device-callable. Marking them is not optional and the failure mode is nasty:
+// without it the kernel compiles, runs, and quietly reads nothing, so the mask
+// -- which goes through PlaneView, and was marked -- comes out bit-exact while
+// every mode that touches the source image comes out empty. The parity test
+// found this; nothing else would have.
+//
+// Defined here rather than reusing MTX_HD from TransformMath.h so that this
+// header keeps depending on nothing.
+#if defined(__CUDACC__)
+    #define AM_HD __host__ __device__
+#else
+    #define AM_HD
+#endif
+
 namespace am {
 
 struct RectI {
   int x1 = 0, y1 = 0, x2 = 0, y2 = 0;  // [x1,x2) [y1,y2)
 
-  int width() const { return x2 - x1; }
-  int height() const { return y2 - y1; }
-  bool empty() const { return x2 <= x1 || y2 <= y1; }
+  AM_HD int width() const { return x2 - x1; }
+  AM_HD int height() const { return y2 - y1; }
+  AM_HD bool empty() const { return x2 <= x1 || y2 <= y1; }
 
   void grow(int px) {
     x1 -= px;
@@ -50,9 +65,9 @@ struct ImageView {
   int height = 0;
   std::ptrdiff_t rowStride = 0;
 
-  const float* row(int y) const { return data + rowStride * y; }
-  const float* at(int x, int y) const { return row(y) + std::ptrdiff_t(x) * 4; }
-  bool valid() const { return data != nullptr && width > 0 && height > 0; }
+  AM_HD const float* row(int y) const { return data + rowStride * y; }
+  AM_HD const float* at(int x, int y) const { return row(y) + std::ptrdiff_t(x) * 4; }
+  AM_HD bool valid() const { return data != nullptr && width > 0 && height > 0; }
 };
 
 // The same, writable. Kept as a separate type rather than a const_cast at the
@@ -63,11 +78,12 @@ struct MutableImageView {
   int height = 0;
   std::ptrdiff_t rowStride = 0;
 
-  float* row(int y) const { return data + rowStride * y; }
-  float* at(int x, int y) const { return row(y) + std::ptrdiff_t(x) * 4; }
-  bool valid() const { return data != nullptr && width > 0 && height > 0; }
+  AM_HD float* row(int y) const { return data + rowStride * y; }
+  AM_HD float* at(int x, int y) const { return row(y) + std::ptrdiff_t(x) * 4; }
+  AM_HD bool valid() const { return data != nullptr && width > 0 && height > 0; }
 
-  ImageView readOnly() const { return ImageView{data, width, height, rowStride}; }
+  AM_HD ImageView readOnly() const { return ImageView{data, width, height, rowStride}; }
 };
 
 }  // namespace am
+

@@ -4,8 +4,15 @@
 
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
+#include "core/MaskBuild.h"
 #include "core/Segmentation.h"
+
+#ifdef AUTOMASK_HAVE_CUDA
+#include "render/CudaRender.h"
+#endif
 
 #define kPluginName        "Auto Mask"
 #define kPluginGrouping    "AutoMask"
@@ -38,6 +45,28 @@ struct AnalysisCache {
     std::shared_ptr<const Segmentation> seg;
 };
 
+/// The built mask, cached on everything it depends on.
+///
+/// Worth its own cache because the dependencies are strictly narrower than the
+/// frame: the mask changes only when the segmentation, the selection or the
+/// mask controls change. Scrubbing a still graphic, or playing one across a
+/// hundred frames, re-derives an identical mask every time otherwise -- and it
+/// is not cheap. Measured at UHD with a 20px feather it is ~50 ms per frame,
+/// which was the single largest per-frame cost in the plugin.
+///
+/// The segmentation is keyed by POINTER, not by content. The analysis cache
+/// above already guarantees that a given Segmentation object corresponds to one
+/// content hash and one set of detect settings, so pointer identity is both
+/// sufficient and free -- and holding the shared_ptr keeps the object alive, so
+/// the address cannot be recycled underneath the comparison.
+struct MaskCache {
+    std::mutex mutex;
+    std::shared_ptr<const Segmentation> seg;
+    std::string points;
+    MaskParams params;
+    std::shared_ptr<const std::vector<float>> mask;
+};
+
 } // namespace am
 
 /// The whole class is declared here, unlike the sibling plugins which only
@@ -49,6 +78,7 @@ class AutoMaskPlugin : public OFX::ImageEffect
 {
 public:
     explicit AutoMaskPlugin(OfxImageEffectHandle p_Handle);
+    ~AutoMaskPlugin() override;
 
     void render(const OFX::RenderArguments& p_Args) override;
     void changedParam(const OFX::InstanceChangedArgs& p_Args,
@@ -68,6 +98,27 @@ public:
 private:
     /// Reads the segmentation controls at @p time into a DetectParams.
     am::DetectParams DetectParamsAt(double time) const;
+
+    /// Everything both render paths need, read once.
+    ///
+    /// Shared deliberately: two copies of "read the parameters and decide what
+    /// they mean" is how a CPU and a GPU path start producing different
+    /// pictures for reasons that have nothing to do with either kernel.
+    struct FrameParams {
+        am::DetectParams det;
+        am::MaskParams mask;
+        int outputMode = 0;
+        int backgroundMode = 0;
+        am::FilterMode filter = am::kFilterBilinear;
+        double posX = 0.0, posY = 0.0;
+        double scaleX = 1.0, scaleY = 1.0;
+        double rotation = 0.0;
+        double anchorX = 0.5, anchorY = 0.5;
+
+        /// The composite parameters for a frame of this size.
+        am::CompositeParams composite(float w, float h) const;
+    };
+    FrameParams ReadFrameParams(double time) const;
 
     /// Bounding box of everything currently selected, in top-down pixels.
     /// Returns false when nothing is selected or nothing has been analysed.
@@ -112,4 +163,26 @@ private:
     OFX::ChoiceParam*   _filter   = nullptr;
 
     mutable am::AnalysisCache _cache;
+    mutable am::MaskCache _maskCache;
+
+#ifdef AUTOMASK_HAVE_CUDA
+    /// Device-resident label image, selection lookup and built mask.
+    ///
+    /// Tracked with its own keys rather than reusing the host mask cache: the
+    /// two can be valid independently, and a frame that hits on the host but
+    /// misses on the device still has to re-upload.
+    am::CudaContext* _cuda = nullptr;
+    std::shared_ptr<const am::Segmentation> _cudaLabelsFor;
+    std::shared_ptr<const am::Segmentation> _cudaMaskSeg;
+    std::string _cudaMaskPoints;
+    am::MaskParams _cudaMaskParams;
+    bool _cudaMaskValid = false;
+    std::vector<float> _downloadBuf;   ///< host staging for the analysis
+    std::mutex _cudaMutex;
+
+    /// Returns false if anything about the device path could not be serviced,
+    /// which is fatal for the frame -- by then the pixel addresses are device
+    /// memory and the CPU loop cannot touch them.
+    bool renderCuda(const OFX::RenderArguments& args, OFX::Image* src, OFX::Image* dst);
+#endif
 };

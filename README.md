@@ -176,13 +176,69 @@ simply does not work. `core/AutoCenter.h` measures the transformed extent of
 the actual selected pixels instead. The `auto_center_transformed` test exists
 because `auto_center` alone cannot tell the two apart, and caught exactly this.
 
-**There is no CUDA path, on purpose.** Labeling is inherently serial and is
-cached per content-hash, so it runs once per content change rather than once
-per frame. The per-frame work is a handful of O(n) passes. The real cost in a
-GPU-resident host is the frame download, and that is paid regardless because
-the labeling lives on the CPU — porting only the blur and the warp would remove
-exactly zero transfers. The CMake block is kept live behind
-`option(AUTOMASK_CUDA)` so turning it on later is a flag, not archaeology.
+**Performance: measure before optimising.** `masktest --bench N` times each
+stage separately, which is the only useful way to look at this — the stages
+have very different caching behaviour, so one end-to-end number tells you
+nothing about what to attack.
+
+Measured at UHD, 24 threads, feather 20 + expand 8 + a transform:
+
+| Stage | Cost | Re-runs when |
+|---|---|---|
+| `HashSource` | 1 ms | every frame |
+| `Segment` | 36 ms | the source pixels change |
+| `BuildMask` | 50 ms | segmentation, selection or mask controls change |
+| `RenderPixel` | 34 ms | every frame |
+
+Two things came out of taking that measurement, both worth not undoing:
+
+*The separable passes transpose rather than stride.* Walking a column of a UHD
+plane strides 3840 floats per step — a cache miss per sample. The blur cost
+294 ms that way against 50 ms via two blocked transposes. `Blur.h` and
+`Dilate` both do the vertical pass as rows of the transpose for this reason.
+
+*The mask is cached separately from the analysis*, because its dependencies are
+strictly narrower than the frame's. Scrubbing or playing a still graphic
+re-derived an identical 50 ms mask on every frame otherwise.
+
+**The CPU cannot reach UHD60, and no amount of tuning changes that.** Pure
+passthrough at UHD — read the frame, write it, no feather, no transform —
+measures 14.8 ms on 24 threads. That is 66 MB of traffic at memory bandwidth. A
+60 fps budget is 16.7 ms, so the CPU is at the wall *before doing any work*.
+This is a bandwidth limit, not an algorithm one, which is why the CUDA path
+exists despite the labelling staying on the CPU.
+
+Device time at UHD, measured by `cudatest`:
+
+| | ms/frame | fps |
+|---|---|---|
+| mask rebuild + composite | 8.1 | 124 |
+| composite only (mask cached — the steady state) | 0.62 | 1600 |
+
+`CudaHashSource` is what makes this work. The labelling still runs on the CPU
+and still needs host pixels, so a naive GPU path would download the frame every
+frame and give most of the win straight back. Instead the content fingerprint
+is computed *on the device* and read back as eight bytes, so the 33 MB moves
+only when the content actually changed. It is deliberately not the same
+function as the host's `HashSource`: FNV-1a is a sequential chain and replaying
+its exact order across thousands of threads costs more than it saves, so the
+device version uses an order-independent combine. The two are never compared
+with each other.
+
+**`cuda_parity` is not optional, and it has already earned its place.** A
+`masktest` render proves nothing about the GPU — it runs the CPU shader. The
+first run of the parity test failed 9 of 14 cases with a max difference of
+exactly 1.0, and the pattern was the tell: every Matte case was bit-exact and
+every case that touched the *source image* was empty. `PlaneView::at` was
+marked `__host__ __device__` and `ImageView::at` was not, so the kernel
+compiled, ran, and silently read nothing. Nothing else in the suite would have
+caught it. Untransformed cases now agree bit-exactly; transformed ones differ by
+~1e-5 where nvcc contracts a multiply-add the host compiler does not.
+
+The kernel is deliberately built as its own static library shared by the plugin
+and the test, so both link the *same compiled kernel* rather than two builds of
+"the same" code — which is precisely the situation a parity test exists to rule
+out. For the same reason it is compiled without `--use_fast_math`.
 
 **Tiling is off and must stay off.** Labeling a tile in isolation shatters
 every element that crosses its boundary.

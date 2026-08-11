@@ -1,4 +1,4 @@
-// Offline harness. Runs the exact code Resolve runs, with no host in the loop.
+﻿// Offline harness. Runs the exact code Resolve runs, with no host in the loop.
 //
 // This is where Threshold, Bridge Gaps and Min Element Size get tuned, because
 // here a guess costs a second and inside Resolve it costs a relaunch. It is
@@ -10,6 +10,7 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +44,7 @@ struct Options {
   bool identityCheck = false;
   bool autoCenter = false;
   bool centerCheck = false;
+  int bench = 0;
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -129,6 +131,8 @@ Options parseArgs(int argc, char** argv) {
       o.autoCenter = true;
     } else if (eq(a, "--center-check")) {
       o.centerCheck = true;
+    } else if (eq(a, "--bench")) {
+      o.bench = std::atoi(next());
     } else {
       die(std::string("unknown option ") + a);
     }
@@ -329,6 +333,66 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Where the time actually goes, per stage.
+  //
+  // Worth having before deciding to port anything to the GPU: the analysis is
+  // cached per content change and the rest is not, so a single end-to-end
+  // number says nothing useful about which one to attack.
+  if (o.bench > 0) {
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
+
+    clk::duration tHash{}, tSeg{}, tResolve{}, tMask{}, tRender{};
+    for (int i = 0; i < o.bench; ++i) {
+      auto t0 = clk::now();
+      volatile std::uint64_t hh = am::HashSource(src, o.det);
+      (void)hh;
+      auto t1 = clk::now();
+      am::Segmentation s2 = am::Segment(src, o.det);
+      auto t2 = clk::now();
+      am::Resolved r2 = am::ResolveSelection(s2, anchors);
+      auto t3 = clk::now();
+      std::vector<float> m2;
+      am::BuildMask(s2, r2, o.mask, m2);
+      auto t4 = clk::now();
+      const am::PlaneView pv{m2.data(), s2.width, s2.height};
+      // Threaded, because that is how the plugin runs it -- a single-threaded
+      // figure here would overstate the cost by the core count and point at the
+      // wrong stage to optimise.
+      am::ParallelFor(
+          s2.height,
+          [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+              for (int x = 0; x < s2.width; ++x)
+                am::RenderPixel(src, pv, cp, x, y, &out[(std::size_t(y) * s2.width + x) * 4]);
+          },
+          16);
+      auto t5 = clk::now();
+
+      tHash += t1 - t0;
+      tSeg += t2 - t1;
+      tResolve += t3 - t2;
+      tMask += t4 - t3;
+      tRender += t5 - t4;
+    }
+    const double n = double(o.bench);
+    std::printf("%dx%d, %d iterations, threaded, per frame:\n", seg.width, seg.height,
+                o.bench);
+    std::printf("  HashSource   %8.2f ms   (every frame)\n", ms(tHash) / n);
+    std::printf("  Segment      %8.2f ms   (only when the content changes)\n", ms(tSeg) / n);
+    std::printf("  Resolve      %8.2f ms   (every frame)\n", ms(tResolve) / n);
+    std::printf("  BuildMask    %8.2f ms   (every frame)\n", ms(tMask) / n);
+    std::printf("  RenderPixel  %8.2f ms   (every frame)\n",
+                ms(tRender) / n);
+    std::printf("  ----\n  cached path  %8.2f ms\n  cold path    %8.2f ms\n",
+                (ms(tHash) + ms(tResolve) + ms(tMask) + ms(tRender)) / n,
+                (ms(tHash) + ms(tSeg) + ms(tResolve) + ms(tMask) + ms(tRender)) / n);
+  }
+
   if (!o.outPath.empty()) writePng(o.outPath, seg.width, seg.height, out);
   return 0;
 }
+
+

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "core/Blur.h"
+#include "core/Parallel.h"
 #include "core/Segmentation.h"
 #include "core/Selection.h"
 
@@ -18,6 +19,11 @@ struct MaskParams {
   float feather = 0.0f;
 
   bool invert = false;
+
+  bool operator==(const MaskParams& o) const {
+    return expand == o.expand && feather == o.feather && invert == o.invert;
+  }
+  bool operator!=(const MaskParams& o) const { return !(*this == o); }
 };
 
 /// Result is w*h floats in [0,1], row-major, top-down, matching seg.labelImage.
@@ -37,7 +43,10 @@ inline void BuildMask(const Segmentation& seg, const Resolved& sel, const MaskPa
 
   // 1. Binary stencil. One indexed load per pixel, no branch.
   std::vector<std::uint8_t> bin(n, 0);
-  for (std::size_t p = 0; p < n; ++p) bin[p] = sel.labelSelected[std::size_t(seg.labelImage[p])];
+  ParallelFor(int(n), [&](int p0, int p1) {
+    for (int p = p0; p < p1; ++p)
+      bin[std::size_t(p)] = sel.labelSelected[std::size_t(seg.labelImage[std::size_t(p)])];
+  });
 
   // 2. Expand / contract.
   //
@@ -52,12 +61,20 @@ inline void BuildMask(const Segmentation& seg, const Resolved& sel, const MaskPa
   if (mp.expand > 0) {
     bin = Dilate(bin, w, h, mp.expand);
   } else if (mp.expand < 0) {
-    for (std::size_t p = 0; p < n; ++p) bin[p] = std::uint8_t(1 - bin[p]);
+    auto flip = [&] {
+      ParallelFor(int(n), [&](int p0, int p1) {
+        for (int p = p0; p < p1; ++p)
+          bin[std::size_t(p)] = std::uint8_t(1 - bin[std::size_t(p)]);
+      });
+    };
+    flip();
     bin = Dilate(bin, w, h, -mp.expand);
-    for (std::size_t p = 0; p < n; ++p) bin[p] = std::uint8_t(1 - bin[p]);
+    flip();
   }
 
-  for (std::size_t p = 0; p < n; ++p) out[p] = float(bin[p]);
+  ParallelFor(int(n), [&](int p0, int p1) {
+    for (int p = p0; p < p1; ++p) out[std::size_t(p)] = float(bin[std::size_t(p)]);
+  });
 
   // 3. Feather. sigma = feather/2 puts roughly 95% of the transition inside the
   //    stated pixel width, so the number on the slider means what it says.
@@ -69,7 +86,9 @@ inline void BuildMask(const Segmentation& seg, const Resolved& sel, const MaskPa
   // control labelled "Expand" and watch the selection shrink. Doing it here
   // keeps "Expand grows the selected elements" true in both states.
   if (mp.invert)
-    for (std::size_t p = 0; p < n; ++p) out[p] = 1.0f - out[p];
+    ParallelFor(int(n), [&](int p0, int p1) {
+      for (int p = p0; p < p1; ++p) out[std::size_t(p)] = 1.0f - out[std::size_t(p)];
+    });
 }
 
 }  // namespace am

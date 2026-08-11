@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "core/Parallel.h"
+
 namespace am {
 namespace {
 
@@ -39,23 +41,56 @@ struct UnionFind {
 // each line is swept twice, carrying the position of the nearest set pixel
 // behind and ahead; a pixel is set if either is within r. Exact for a binary
 // mask, and identical to the window scan it replaces.
-void dilateLine(const std::uint8_t* src, std::uint8_t* dst, int n, std::ptrdiff_t stride,
-                int r, std::vector<int>& prev, std::vector<int>& next) {
+// Contiguous only. The vertical pass gets there by transposing rather than by
+// striding down columns -- see the note in Blur.h; the cost of a strided pass
+// over a UHD plane is a cache miss per sample, and it dominates everything.
+void dilateRow(const std::uint8_t* src, std::uint8_t* dst, int n, int r, std::vector<int>& prev,
+               std::vector<int>& next) {
   const int kFar = std::numeric_limits<int>::max() / 4;
+  prev.resize(std::size_t(n));
+  next.resize(std::size_t(n));
 
   int last = -kFar;
   for (int i = 0; i < n; ++i) {
-    if (src[i * stride]) last = i;
+    if (src[i]) last = i;
     prev[std::size_t(i)] = last;
   }
   int ahead = kFar;
   for (int i = n - 1; i >= 0; --i) {
-    if (src[i * stride]) ahead = i;
+    if (src[i]) ahead = i;
     next[std::size_t(i)] = ahead;
   }
   for (int i = 0; i < n; ++i)
-    dst[i * stride] =
-        std::uint8_t((i - prev[std::size_t(i)] <= r) || (next[std::size_t(i)] - i <= r));
+    dst[i] = std::uint8_t((i - prev[std::size_t(i)] <= r) || (next[std::size_t(i)] - i <= r));
+}
+
+void transposeBytes(const std::uint8_t* src, std::uint8_t* dst, int w, int h) {
+  constexpr int kBlock = 32;
+  ParallelFor(
+      (h + kBlock - 1) / kBlock,
+      [&](int b0, int b1) {
+        for (int bi = b0; bi < b1; ++bi) {
+          const int y0 = bi * kBlock, y1 = std::min(y0 + kBlock, h);
+          for (int x0 = 0; x0 < w; x0 += kBlock) {
+            const int x1 = std::min(x0 + kBlock, w);
+            for (int y = y0; y < y1; ++y)
+              for (int x = x0; x < x1; ++x)
+                dst[std::size_t(x) * h + y] = src[std::size_t(y) * w + x];
+          }
+        }
+      },
+      1);
+}
+
+void dilateAllRows(const std::uint8_t* src, std::uint8_t* dst, int w, int h, int r) {
+  ParallelFor(
+      h,
+      [&](int y0, int y1) {
+        std::vector<int> prev, next;
+        for (int y = y0; y < y1; ++y)
+          dilateRow(src + std::size_t(y) * w, dst + std::size_t(y) * w, w, r, prev, next);
+      },
+      64);
 }
 
 // Rec.709. Computed on premultiplied values, which is exact for the a == 1.0
@@ -76,15 +111,14 @@ inline float sampleFor(const float* px, SegmentMode mode) {
 
 std::vector<std::uint8_t> Dilate(const std::vector<std::uint8_t>& src, int w, int h, int r) {
   if (r <= 0) return src;
-  std::vector<std::uint8_t> tmp(std::size_t(w) * h, 0);
-  std::vector<std::uint8_t> out(std::size_t(w) * h, 0);
-  std::vector<int> prev(std::size_t(std::max(w, h))), next(std::size_t(std::max(w, h)));
+  const std::size_t n = std::size_t(w) * h;
+  std::vector<std::uint8_t> a(n, 0), b(n, 0);
 
-  for (int y = 0; y < h; ++y)
-    dilateLine(&src[std::size_t(y) * w], &tmp[std::size_t(y) * w], w, 1, r, prev, next);
-  for (int x = 0; x < w; ++x)
-    dilateLine(&tmp[std::size_t(x)], &out[std::size_t(x)], h, w, r, prev, next);
-  return out;
+  dilateAllRows(src.data(), a.data(), w, h, r);   // horizontal
+  transposeBytes(a.data(), b.data(), w, h);       // now h x w
+  dilateAllRows(b.data(), a.data(), h, w, r);     // vertical, as rows
+  transposeBytes(a.data(), b.data(), h, w);       // back to w x h
+  return b;
 }
 
 int32_t Segmentation::labelNear(int x, int y, int radius) const {

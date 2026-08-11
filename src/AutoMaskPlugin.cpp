@@ -194,6 +194,43 @@ am::DetectParams AutoMaskPlugin::DetectParamsAt(double time) const
     return d;
 }
 
+AutoMaskPlugin::FrameParams AutoMaskPlugin::ReadFrameParams(double time) const
+{
+    FrameParams f;
+    f.det = DetectParamsAt(time);
+
+    f.mask.expand = IntAt(_expand, time);
+    f.mask.feather = float(DoubleAt(_feather, time));
+    f.mask.invert = BoolAt(_invertMask, time);
+
+    f.outputMode = ChoiceAt(_outputMode, time);
+    f.backgroundMode = BoolAt(_leaveOriginal, time) ? kBgLeft : kBgRemoved;
+    f.filter = ChoiceAt(_filter, time) == kFilterOptNearest ? kFilterNearest : kFilterBilinear;
+
+    Double2DAt(_xfPos, time, f.posX, f.posY);
+    Double2DAt(_xfAnchor, time, f.anchorX, f.anchorY);
+    f.scaleX = DoubleAt(_xfScale, time);
+    // Linked means Scale Y is simply NOT READ. There is nothing to write back
+    // and nothing to keep in step; the field is hidden precisely so the panel
+    // cannot show a number that is not in force.
+    f.scaleY = BoolAt(_xfLink, time) ? f.scaleX : DoubleAt(_xfScaleY, time);
+    f.rotation = DoubleAt(_xfRot, time);
+    return f;
+}
+
+am::CompositeParams AutoMaskPlugin::FrameParams::composite(float w, float h) const
+{
+    CompositeParams cp;
+    cp.outputMode = outputMode;
+    cp.backgroundMode = backgroundMode;
+    cp.filter = filter;
+    cp.identity = TransformIsIdentity(posX, posY, scaleX, scaleY, rotation);
+    if (!cp.identity)
+        cp.inv = mtx::Invert(
+            MakeElementTransform(w, h, posX, posY, scaleX, scaleY, rotation, anchorX, anchorY));
+    return cp;
+}
+
 bool AutoMaskPlugin::SelectionBounds(double /*time*/, const Segmentation& seg, RectI& out) const
 {
     if (seg.empty()) return false;
@@ -245,6 +282,18 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
         return;
     }
 
+#ifdef AUTOMASK_HAVE_CUDA
+    if (p_Args.isEnabledCudaRender && CudaAvailable())
+    {
+        // No fallback on failure, deliberately. By this point the host has
+        // handed over DEVICE pointers; the CPU loop below cannot touch them, so
+        // "try the GPU, fall back to the CPU" is not a thing that exists here.
+        if (!renderCuda(p_Args, src.get(), dst.get()))
+            OFX::throwSuiteStatusException(kOfxStatFailed);
+        return;
+    }
+#endif
+
     // Tiles and multi-resolution are off, so src and dst share bounds and one
     // top-down space serves both. The render window may still be a sub-rect of
     // them, which is why the analysis runs over the whole of `region` and only
@@ -255,7 +304,8 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     const MutableImageView dstView = MakeDstView(dst.get(), region);
     if (!srcView.valid() || !dstView.valid()) return;
 
-    const DetectParams det = DetectParamsAt(p_Args.time);
+    const FrameParams fp = ReadFrameParams(p_Args.time);
+    const DetectParams det = fp.det;
 
     // --- analysis, cached on content ----------------------------------------
     const std::uint64_t hash = HashSource(srcView, det);
@@ -275,38 +325,28 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     }
 
     // --- selection and mask --------------------------------------------------
-    const std::vector<Anchor> anchors = ParseAnchors(StringOf(_selectedPoints));
-    const Resolved sel = ResolveSelection(*seg, anchors);
+    const std::string points = StringOf(_selectedPoints);
+    const MaskParams mp = fp.mask;
 
-    MaskParams mp;
-    mp.expand = IntAt(_expand, p_Args.time);
-    mp.feather = float(DoubleAt(_feather, p_Args.time));
-    mp.invert = BoolAt(_invertMask, p_Args.time);
+    std::shared_ptr<const std::vector<float>> mask;
+    {
+        std::lock_guard<std::mutex> lock(_maskCache.mutex);
+        if (_maskCache.seg != seg || _maskCache.points != points ||
+            _maskCache.params != mp || !_maskCache.mask)
+        {
+            auto built = std::make_shared<std::vector<float>>();
+            BuildMask(*seg, ResolveSelection(*seg, ParseAnchors(points)), mp, *built);
 
-    std::vector<float> mask;
-    BuildMask(*seg, sel, mp, mask);
+            _maskCache.seg = seg;
+            _maskCache.points = points;
+            _maskCache.params = mp;
+            _maskCache.mask = built;
+        }
+        mask = _maskCache.mask;  // refcount bump, not a copy
+    }
 
     // --- transform -----------------------------------------------------------
-    const float w = float(srcView.width), h = float(srcView.height);
-
-    double px = 0.0, py = 0.0, ax = 0.5, ay = 0.5;
-    Double2DAt(_xfPos, p_Args.time, px, py);
-    Double2DAt(_xfAnchor, p_Args.time, ax, ay);
-    const double sx = DoubleAt(_xfScale, p_Args.time);
-    // Linked means Scale Y is simply NOT READ. There is nothing to write back
-    // and nothing to keep in step; the field is hidden precisely so the panel
-    // cannot show a number that is not in force.
-    const double sy = BoolAt(_xfLink, p_Args.time) ? sx : DoubleAt(_xfScaleY, p_Args.time);
-    const double rot = DoubleAt(_xfRot, p_Args.time);
-
-    CompositeParams cp;
-    cp.outputMode = ChoiceAt(_outputMode, p_Args.time);
-    cp.backgroundMode = BoolAt(_leaveOriginal, p_Args.time) ? kBgLeft : kBgRemoved;
-    cp.filter = ChoiceAt(_filter, p_Args.time) == kFilterOptNearest ? kFilterNearest
-                                                                    : kFilterBilinear;
-    cp.identity = TransformIsIdentity(px, py, sx, sy, rot);
-    if (!cp.identity)
-        cp.inv = mtx::Invert(MakeElementTransform(w, h, px, py, sx, sy, rot, ax, ay));
+    const CompositeParams cp = fp.composite(float(srcView.width), float(srcView.height));
 
     // --- write ---------------------------------------------------------------
     // The render window arrives in host (bottom-up) coordinates; flip it into
@@ -319,7 +359,7 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     window.y2 = std::min(window.y2, dstView.height);
     if (window.empty()) return;
 
-    const PlaneView plane{mask.data(), seg->width, seg->height};
+    const PlaneView plane{mask->data(), seg->width, seg->height};
     BandRenderer renderer(srcView, dstView, plane, cp, window);
     renderer.multiThread();
 
@@ -330,6 +370,113 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     // function is already holding the result of. The read-out is refreshed from
     // changedParam instead, which is the only place a write is legal.
 }
+
+#ifdef AUTOMASK_HAVE_CUDA
+
+AutoMaskPlugin::~AutoMaskPlugin()
+{
+    if (_cuda) CudaDestroy(_cuda);
+}
+
+bool AutoMaskPlugin::renderCuda(const OFX::RenderArguments& p_Args, OFX::Image* src,
+                                OFX::Image* dst)
+{
+    std::lock_guard<std::mutex> lock(_cudaMutex);
+
+    if (!_cuda)
+    {
+        _cuda = CudaCreate();
+        if (!_cuda) return false;
+    }
+
+    const OfxRectI b = dst->getBounds();
+    const int w = b.x2 - b.x1;
+    const int h = b.y2 - b.y1;
+    if (w <= 0 || h <= 0) return false;
+
+    // Device pointers. These must NOT be dereferenced here -- only offset.
+    const std::ptrdiff_t srcStride =
+        std::ptrdiff_t(src->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+    const std::ptrdiff_t dstStride =
+        std::ptrdiff_t(dst->getRowBytes()) / std::ptrdiff_t(sizeof(float));
+    auto* srcBase = static_cast<const float*>(src->getPixelData());
+    auto* dstBase = static_cast<float*>(dst->getPixelData());
+    if (!srcBase || !dstBase || srcStride <= 0 || dstStride <= 0) return false;
+
+    void* stream = p_Args.pCudaStream;
+    const FrameParams fp = ReadFrameParams(p_Args.time);
+
+    // --- analysis, keyed on a fingerprint computed ON THE DEVICE -------------
+    //
+    // This is what keeps the labelling on the CPU from costing a full frame
+    // download every frame: the hash comes back as eight bytes, and the 33 MB
+    // only moves when the content has actually changed.
+    const std::uint64_t hash =
+        CudaHashSource(_cuda, srcBase, w, h, srcStride,
+                       fp.det.mode == SegmentMode::Luminance ? 1 : 0, fp.det.threshold, stream);
+
+    std::shared_ptr<const Segmentation> seg;
+    {
+        std::lock_guard<std::mutex> clock(_cache.mutex);
+        if (hash != _cache.hash || w != _cache.width || h != _cache.height ||
+            fp.det != _cache.params || !_cache.seg)
+        {
+            _downloadBuf.resize(std::size_t(w) * h * 4);
+            if (!CudaDownload(_cuda, srcBase, w, h, srcStride, _downloadBuf.data(), stream))
+                return false;
+
+            // The download is bottom-up, as the host image is. A top-down view
+            // of it is a negative row stride from the last row -- no flip pass,
+            // exactly as on the CPU path.
+            const ImageView topDown{_downloadBuf.data() + std::size_t(h - 1) * w * 4, w, h,
+                                    -std::ptrdiff_t(w) * 4};
+
+            _cache.hash = hash;
+            _cache.width = w;
+            _cache.height = h;
+            _cache.params = fp.det;
+            _cache.seg = std::make_shared<const Segmentation>(Segment(topDown, fp.det));
+        }
+        seg = _cache.seg;
+    }
+
+    const std::string points = StringOf(_selectedPoints);
+    const Resolved sel = ResolveSelection(*seg, ParseAnchors(points));
+
+    if (_cudaLabelsFor != seg)
+    {
+        if (!CudaUploadLabels(_cuda, seg->labelImage.data(), w, h, stream)) return false;
+        _cudaLabelsFor = seg;
+        _cudaMaskValid = false;
+    }
+
+    // One byte per element, so there is no point caching this separately.
+    if (!CudaUploadSelection(_cuda, sel.labelSelected.data(), seg->count(), stream))
+        return false;
+
+    if (!_cudaMaskValid || _cudaMaskSeg != seg || _cudaMaskPoints != points ||
+        _cudaMaskParams != fp.mask)
+    {
+        if (!CudaBuildMask(_cuda, w, h, fp.mask.expand, fp.mask.feather, fp.mask.invert, stream))
+            return false;
+        _cudaMaskSeg = seg;
+        _cudaMaskPoints = points;
+        _cudaMaskParams = fp.mask;
+        _cudaMaskValid = true;
+    }
+
+    // Top-down views of both images, as negative strides from the last row, so
+    // the kernel indexes the same space the label image and mask are in.
+    const CompositeParams cp = fp.composite(float(w), float(h));
+    return CudaRender(_cuda, srcBase + srcStride * (h - 1), dstBase + dstStride * (h - 1), w, h,
+                      -srcStride, -dstStride, cp, stream);
+}
+
+#else
+
+AutoMaskPlugin::~AutoMaskPlugin() = default;
+
+#endif  // AUTOMASK_HAVE_CUDA
 
 // -------------------------------------------------------------- changedParam
 
@@ -686,10 +833,20 @@ void AutoMaskPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
     // reliably picked up from the per-context pass.
     am::RegisterOverlay(p_Desc);
 
-    // No CUDA. See the rationale block in CMakeLists.txt: the labelling is
-    // serial and cached per content change, and declaring no GPU support makes
-    // the host do the transfer itself rather than handing over device pointers
-    // the analysis cannot read.
+#ifdef AUTOMASK_HAVE_CUDA
+    // Declared only when a device actually exists. Claiming CUDA on a machine
+    // with no GPU would have the host hand over device pointers that cannot be
+    // serviced, and by then there is no way back to the CPU loop -- the pixel
+    // addresses are already device memory.
+    if (am::CudaAvailable())
+    {
+        p_Desc.setSupportsCudaRender(true);
+        // Without this Resolve pulls every frame down to system memory and
+        // pushes the result back, which is most of what the GPU path exists to
+        // avoid.
+        p_Desc.setSupportsCudaStream(true);
+    }
+#endif
 }
 
 void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc,

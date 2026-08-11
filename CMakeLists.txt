@@ -35,7 +35,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 #
 # The block below is kept live rather than deleted so turning it on later is a
 # flag, not an archaeology exercise.
-option(AUTOMASK_CUDA "Build the CUDA render path" OFF)
+option(AUTOMASK_CUDA "Build the CUDA render path" ON)
 set(AUTOMASK_HAVE_CUDA OFF)
 if(AUTOMASK_CUDA)
     # Real SASS for Turing/Ampere/Ada/Blackwell plus virtual PTX so
@@ -84,6 +84,24 @@ add_library(ofxsupport STATIC
 target_include_directories(ofxsupport PUBLIC "${OFX_INCLUDE}" "${OFX_SUPPORT}/include")
 target_compile_definitions(ofxsupport PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 
+# --- CUDA render path ----------------------------------------------------------
+# Its own library so the plugin and the parity test link the exact same compiled
+# kernel rather than two separate builds of it. Two builds of "the same" kernel
+# is precisely the situation the parity test exists to rule out.
+if(AUTOMASK_HAVE_CUDA)
+    add_library(amcuda STATIC src/render/CudaKernel.cu)
+    target_include_directories(amcuda PUBLIC src)
+    set_target_properties(amcuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_RUNTIME_LIBRARY Static
+        POSITION_INDEPENDENT_CODE ON
+    )
+    # Deliberately NOT --use_fast_math. The whole point of the shared header is
+    # that the CPU and GPU agree; fast-math lets nvcc substitute lower-precision
+    # intrinsics on one side of that pair only, and the parity test would start
+    # failing for a reason that has nothing to do with the code.
+endif()
+
 # --- The plugin --------------------------------------------------------------
 # src/core includes no OFX header, so the offline harness links the identical
 # code Resolve runs. Keep it that way: the moment core needs ofxsImageEffect.h,
@@ -96,6 +114,11 @@ add_library(AutoMask MODULE
 )
 target_include_directories(AutoMask PRIVATE src)
 target_link_libraries(AutoMask PRIVATE ofxsupport)
+
+if(AUTOMASK_HAVE_CUDA)
+    target_link_libraries(AutoMask PRIVATE amcuda)
+    target_compile_definitions(AutoMask PRIVATE AUTOMASK_HAVE_CUDA)
+endif()
 
 # OFX plugins are DLLs with a .ofx extension and a single exported entry point.
 set_target_properties(AutoMask PROPERTIES
@@ -147,6 +170,14 @@ add_test(NAME auto_center
 # And again with a scale and a rotation in force. Solving for the translation
 # without accounting for those is right only at scale 1 / rotation 0, which is
 # exactly the case the simple test above cannot distinguish.
+# CPU/GPU parity. Skips itself, rather than failing, on a machine with no GPU.
+if(AUTOMASK_HAVE_CUDA)
+    add_executable(cudatest tools/cudatest.cpp src/core/Segmentation.cpp)
+    target_include_directories(cudatest PRIVATE src)
+    target_link_libraries(cudatest PRIVATE amcuda)
+    add_test(NAME cuda_parity COMMAND cudatest)
+endif()
+
 add_test(NAME auto_center_transformed
          COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/centered_xf.png"
                  --select "0.34,0.79" --output cutoutpm --scale 1.6,0.7 --rot 35

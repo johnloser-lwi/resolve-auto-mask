@@ -115,14 +115,30 @@ MTX_HD inline void SampleElement(const ImageView& src, const PlaneView& mask, fl
 
   float corner[4][4];
   float cov[4];
-  const int ox[4] = {0, 1, 0, 1};
-  const int oy[4] = {0, 0, 1, 1};
-  for (int k = 0; k < 4; ++k) {
-    float s[4];
-    FetchTexel(src, x0 + ox[k], y0 + oy[k], kEdgeBlack, s);
-    const float m = FetchPlane(mask, x0 + ox[k], y0 + oy[k], kEdgeBlack);
-    cov[k] = m;
-    for (int c = 0; c < 4; ++c) corner[k][c] = s[c] * m;
+
+  if (FootprintInside(x0, y0, src.width, src.height)) {
+    // Interior: four straight loads, no bounds tests, and the two rows are
+    // contiguous so the second is almost always already in cache.
+    const float* r0 = src.at(x0, y0);
+    const float* r1 = src.at(x0, y0 + 1);
+    const float* m0 = &mask.data[std::ptrdiff_t(y0) * mask.width + x0];
+    const float* m1 = m0 + mask.width;
+    const float* rs[4] = {r0, r0 + 4, r1, r1 + 4};
+    cov[0] = m0[0];
+    cov[1] = m0[1];
+    cov[2] = m1[0];
+    cov[3] = m1[1];
+    for (int k = 0; k < 4; ++k)
+      for (int c = 0; c < 4; ++c) corner[k][c] = rs[k][c] * cov[k];
+  } else {
+    const int ox[4] = {0, 1, 0, 1};
+    const int oy[4] = {0, 0, 1, 1};
+    for (int k = 0; k < 4; ++k) {
+      float s[4];
+      FetchTexel(src, x0 + ox[k], y0 + oy[k], kEdgeBlack, s);
+      cov[k] = FetchPlane(mask, x0 + ox[k], y0 + oy[k], kEdgeBlack);
+      for (int c = 0; c < 4; ++c) corner[k][c] = s[c] * cov[k];
+    }
   }
 
   for (int c = 0; c < 4; ++c) {
@@ -138,66 +154,92 @@ MTX_HD inline void SampleElement(const ImageView& src, const PlaneView& mask, fl
 /// @param x,y integer destination pixel, in source/mask pixel space (top-down).
 MTX_HD inline void RenderPixel(const ImageView& src, const PlaneView& mask,
                                const CompositeParams& p, int x, int y, float* out) {
-  const float M = FetchPlane(mask, x, y, kEdgeBlack);
+  // Each mode fetches only what it consumes.
+  //
+  // The straightforward version sampled the element, the coverage AND the
+  // unmasked warped source up front and then chose between them -- but only
+  // Cutout ever reads the last of those, so a third of the memory traffic went
+  // straight in the bin. Matte is the starkest case: it needs the mask plane
+  // and nothing else, and used to pull twelve RGBA texels to produce one float.
+  // At UHD this stage is memory-bound, so a fetch avoided is time saved
+  // roughly one for one.
 
-  float S[4];
-  FetchTexel(src, x, y, kEdgeBlack, S);
+  float sx = 0.0f, sy = 0.0f;
+  if (!p.identity) p.inv.Apply(float(x) + 0.5f, float(y) + 0.5f, sx, sy);
+
+  // --- the modes that never touch the unwarped frame -----------------------
+
+  if (p.outputMode == kOutMatte) {
+    // The matte follows the transform. One that did not would not line up with
+    // the cutout the user just looked at, and finding that out downstream costs
+    // an afternoon.
+    const float Aw = p.identity ? FetchPlane(mask, x, y, kEdgeBlack)
+                                : SamplePlane(mask, sx, sy, p.filter, kEdgeBlack);
+    out[0] = out[1] = out[2] = out[3] = Aw;
+    return;
+  }
+
+  if (p.outputMode == kOutCutout) {
+    // Colour must stay defined at the edge here, so it comes from the UNMASKED
+    // source; only the alpha is gated.
+    float Sw[4];
+    float Aw;
+    if (p.identity) {
+      FetchTexel(src, x, y, kEdgeBlack, Sw);
+      Aw = FetchPlane(mask, x, y, kEdgeBlack);
+    } else {
+      SampleImage(src, sx, sy, p.filter, kEdgeBlack, Sw);
+      Aw = SamplePlane(mask, sx, sy, p.filter, kEdgeBlack);
+    }
+    out[0] = Sw[0];
+    out[1] = Sw[1];
+    out[2] = Sw[2];
+    out[3] = Sw[3] * Aw;
+    return;
+  }
+
+  // --- the element layer, shared by the rest -------------------------------
 
   float Ew[4];
-  float Sw[4];
   float Aw;
+  float M = 0.0f;
+  float S[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  const bool needsBackground = (p.outputMode == kOutComposite || p.outputMode == kOutPreview);
+  if (needsBackground) {
+    M = FetchPlane(mask, x, y, kEdgeBlack);
+    FetchTexel(src, x, y, kEdgeBlack, S);
+  }
 
   if (p.identity) {
     // Not merely an optimisation. Identity is the common case -- it is what the
     // plugin is in the entire time the user is picking elements -- and taking
     // the untransformed values verbatim guarantees bit-exact passthrough
     // instead of relying on the resampler to reproduce its input.
-    Aw = M;
-    for (int c = 0; c < 4; ++c) {
-      Sw[c] = S[c];
-      Ew[c] = S[c] * M;
+    if (!needsBackground) {
+      M = FetchPlane(mask, x, y, kEdgeBlack);
+      FetchTexel(src, x, y, kEdgeBlack, S);
     }
+    Aw = M;
+    for (int c = 0; c < 4; ++c) Ew[c] = S[c] * M;
   } else {
-    float sx, sy;
-    p.inv.Apply(float(x) + 0.5f, float(y) + 0.5f, sx, sy);
     SampleElement(src, mask, sx, sy, p.filter, Ew, Aw);
-    SampleImage(src, sx, sy, p.filter, kEdgeBlack, Sw);
   }
 
-  switch (p.outputMode) {
-    case kOutMatte:
-      // The matte follows the transform. A matte that did not would not line up
-      // with the cutout the user just looked at, and finding that out downstream
-      // costs an afternoon.
-      out[0] = out[1] = out[2] = out[3] = Aw;
-      return;
+  if (p.outputMode == kOutCutoutPM) {
+    out[0] = Ew[0];
+    out[1] = Ew[1];
+    out[2] = Ew[2];
+    out[3] = Ew[3];
+    return;
+  }
 
-    case kOutCutoutPM:
-      out[0] = Ew[0];
-      out[1] = Ew[1];
-      out[2] = Ew[2];
-      out[3] = Ew[3];
-      return;
-
-    case kOutCutout:
-      // Colour must stay defined at the edge here, so it comes from the
-      // unmasked warp; only the alpha is gated.
-      out[0] = Sw[0];
-      out[1] = Sw[1];
-      out[2] = Sw[2];
-      out[3] = Sw[3] * Aw;
-      return;
-
-    case kOutPreview:
-      // The selection as it will actually look, over a ghost of the rest so
-      // there is something to click. Not hole-aware: this is an aiming aid, and
-      // seeing where an element came from is useful while placing it.
-      for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * kPreviewDim;
-      return;
-
-    case kOutComposite:
-    default:
-      break;
+  if (p.outputMode == kOutPreview) {
+    // The selection as it will actually look, over a ghost of the rest so there
+    // is something to click. Not hole-aware: this is an aiming aid, and seeing
+    // where an element came from is useful while placing it.
+    for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * kPreviewDim;
+    return;
   }
 
   if (p.backgroundMode == kBgLeft) {
