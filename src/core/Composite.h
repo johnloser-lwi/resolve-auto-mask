@@ -267,4 +267,73 @@ MTX_HD inline void RenderPixel(const ImageView& src, const PlaneView& mask,
   for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * keep;
 }
 
+/// The final combine, reading an already-warped element layer.
+///
+/// Mirrors RenderPixel's mode handling exactly. It is a separate function
+/// rather than a flag inside RenderPixel because the per-pixel hot path of the
+/// common case should not carry a branch for the rare one.
+MTX_HD inline void RenderPixelLayered(const ImageView& src, const PlaneView& mask,
+                                      const ImageView& layerColour,
+                                      const PlaneView& layerCoverage, const CompositeParams& p,
+                                      int x, int y, float* out) {
+  float Ew[4];
+  float Aw;
+
+  if (p.identity) {
+    const float* e = layerColour.at(x, y);
+    for (int c = 0; c < 4; ++c) Ew[c] = e[c];
+    Aw = layerCoverage.at(x, y);
+  } else {
+    // The global transform, applied to the finished arrangement. Colour and
+    // coverage are sampled from buffers that were built together, and the
+    // colour is already premultiplied by the coverage, so interpolating them
+    // separately here is consistent -- the halo problem SampleElement guards
+    // against was already dealt with when the layer was built.
+    float sx, sy;
+    p.inv.Apply(float(x) + 0.5f, float(y) + 0.5f, sx, sy);
+    SampleImage(layerColour, sx, sy, p.filter, kEdgeBlack, Ew);
+    Aw = SamplePlane(layerCoverage, sx, sy, p.filter, kEdgeBlack);
+  }
+
+  if (p.outputMode == kOutMatte) {
+    out[0] = out[1] = out[2] = out[3] = Aw;
+    return;
+  }
+
+  if (p.outputMode == kOutCutoutPM) {
+    for (int c = 0; c < 4; ++c) out[c] = Ew[c];
+    return;
+  }
+
+  if (p.outputMode == kOutCutout) {
+    // There is no single "unmasked warped source" once elements move
+    // independently, so the straight colour is recovered from the
+    // premultiplied layer instead.
+    const float inv = Aw > 1e-6f ? 1.0f / Aw : 0.0f;
+    out[0] = Ew[0] * inv;
+    out[1] = Ew[1] * inv;
+    out[2] = Ew[2] * inv;
+    out[3] = Aw;
+    return;
+  }
+
+  // The hole and the background are both unwarped: the hole belongs where the
+  // elements CAME FROM, which the global transform does not move.
+  const float M = mask.at(x, y);
+  const float* S = src.at(x, y);
+
+  if (p.outputMode == kOutPreview) {
+    for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * kPreviewDim;
+    return;
+  }
+
+  if (p.backgroundMode == kBgLeft) {
+    for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - Aw);
+    return;
+  }
+
+  const float occl = mtx::Clamp01(Aw - M);
+  for (int c = 0; c < 4; ++c) out[c] = Ew[c] + S[c] * (1.0f - M) * (1.0f - occl);
+}
+
 }  // namespace am

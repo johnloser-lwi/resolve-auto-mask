@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "core/Arrange.h"
+#include "core/ElementLayer.h"
 #include "core/MaskBuild.h"
 #include "core/Segmentation.h"
 
@@ -67,6 +69,20 @@ struct MaskCache {
     std::shared_ptr<const std::vector<float>> mask;
 };
 
+/// The arranged element layer, cached on the same terms as the mask plus the
+/// arrangement. Notably NOT on the global transform: the layer is built in
+/// arranged space and the composite warps it, so dragging Position re-warps a
+/// cached layer instead of rebuilding one.
+struct LayerCache {
+    std::mutex mutex;
+    std::shared_ptr<const Segmentation> seg;
+    std::string points;
+    MaskParams maskParams;
+    ArrangeParams arrangeParams;
+    std::shared_ptr<const ElementLayer> layer;   ///< null when nothing is arranged
+    bool valid = false;
+};
+
 } // namespace am
 
 /// The whole class is declared here, unlike the sibling plugins which only
@@ -107,6 +123,7 @@ private:
     struct FrameParams {
         am::DetectParams det;
         am::MaskParams mask;
+        am::ArrangeParams arrange;
         int outputMode = 0;
         int backgroundMode = 0;
         am::FilterMode filter = am::kFilterBilinear;
@@ -160,10 +177,26 @@ private:
     OFX::Double2DParam* _xfAnchor = nullptr;
     OFX::PushButtonParam* _anchorToSel = nullptr;
     OFX::PushButtonParam* _autoCenter  = nullptr;
+
+    OFX::ChoiceParam*   _arrangeMode    = nullptr;
+    OFX::ChoiceParam*   _arrangeOrder   = nullptr;
+    OFX::BooleanParam*  _arrangeReverse = nullptr;
+    OFX::DoubleParam*   _spread         = nullptr;
+    OFX::Double2DParam* _step           = nullptr;
+    OFX::ChoiceParam*   _alignH         = nullptr;
+    OFX::ChoiceParam*   _alignV         = nullptr;
     OFX::ChoiceParam*   _filter   = nullptr;
 
     mutable am::AnalysisCache _cache;
     mutable am::MaskCache _maskCache;
+    mutable am::LayerCache _layerCache;
+
+    /// The element layer for this frame, or null if nothing is arranged.
+    /// Shared by both render paths so they cannot disagree about what "moved"
+    /// means.
+    std::shared_ptr<const am::ElementLayer> LayerFor(
+        const am::ImageView& src, const std::shared_ptr<const am::Segmentation>& seg,
+        const std::string& points, const FrameParams& fp) const;
 
 #ifdef AUTOMASK_HAVE_CUDA
     /// Device-resident label image, selection lookup and built mask.
@@ -178,6 +211,7 @@ private:
     am::MaskParams _cudaMaskParams;
     bool _cudaMaskValid = false;
     std::vector<float> _downloadBuf;   ///< host staging for the analysis
+    std::shared_ptr<const am::ElementLayer> _cudaLayer;  ///< what is resident on the device
     std::mutex _cudaMutex;
 
     /// Returns false if anything about the device path could not be serviced,

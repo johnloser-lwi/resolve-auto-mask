@@ -79,6 +79,28 @@ bool CudaRender(CudaContext* ctx, const float* devSrc, float* devDst, int width,
                 std::ptrdiff_t srcStrideFloats, std::ptrdiff_t dstStrideFloats,
                 const CompositeParams& params, void* stream);
 
+/// Upload an arranged element layer, built on the host.
+///
+/// The layer is built on the CPU rather than scattered on the device, and that
+/// is a considered trade rather than laziness. Scattering means one kernel per
+/// element with a per-element feathered tile, and the elements have to be
+/// composited in order because "over" does not commute -- so the parallelism is
+/// only within each element anyway. Meanwhile the layer is built in arranged
+/// space, so it survives every change to Position, Scale and Rotation, and the
+/// upload happens when the SELECTION or the arrangement changes rather than per
+/// frame.
+bool CudaUploadLayer(CudaContext* ctx, const float* colour, const float* coverage, int width,
+                     int height, void* stream);
+
+/// Drop any resident layer, so the next render uses the single-pass path.
+void CudaClearLayer(CudaContext* ctx);
+
+/// Composite using the resident layer instead of warping the source directly.
+bool CudaRenderLayered(CudaContext* ctx, const float* devSrc, float* devDst, int width,
+                       int height, std::ptrdiff_t srcStrideFloats,
+                       std::ptrdiff_t dstStrideFloats, const CompositeParams& params,
+                       void* stream);
+
 /// Synchronous entry point for the parity test, running the whole chain on
 /// host buffers. Exists so the test links the IDENTICAL compiled kernel the
 /// plugin does, rather than a second build of "the same" code -- which is
@@ -95,5 +117,12 @@ bool CudaBench(int width, int height, int expand, float feather, bool invert,
 bool CudaRenderHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
                         const std::uint8_t* selected, int labelCount, int width, int height,
                         int expand, float feather, bool invert, const CompositeParams& params);
+
+/// The same, through the layered path, for an element layer built on the host.
+bool CudaRenderLayeredHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
+                               const std::uint8_t* selected, int labelCount, int width,
+                               int height, int expand, float feather, bool invert,
+                               const float* layerColour, const float* layerCoverage,
+                               const CompositeParams& params);
 
 }  // namespace am

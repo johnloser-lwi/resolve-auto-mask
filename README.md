@@ -38,8 +38,14 @@ That matters. Storing element *numbers* would be simpler and would break
 constantly: components are numbered in raster order, so nudging Threshold,
 changing Min Element Size, or an element merely moving between frames
 renumbers everything and the selection silently jumps to different objects.
-Points also make the selection resolution-independent for free, and let it
-follow an element that moves.
+Points also make the selection resolution-independent for free.
+
+They do **not** track motion, and it is worth being clear about that: an anchor
+is a fixed point, so it keeps selecting an element only while the element still
+covers it. On a static graphic that is always. On moving footage the element
+eventually slides off its anchor and the selection drops out — the anchor turns
+into a red X rather than following. Making anchors stick to their element
+across frames is a real feature, and it is not implemented.
 
 A point that stops matching anything is **kept**, not deleted, and drawn as a
 red X in the viewer. Dragging Threshold too far must not destroy a selection
@@ -97,6 +103,26 @@ a preview toggle you can forget is on is worse than no preview at all.
 `Anchor`, `Anchor to Selection`, `Auto Center`, `Filter`. Set Output to
 **Composite** to see the selection move within the picture rather than on its
 own.
+
+**Arrange** — `Mode` (None / Spread / Stagger / Align), `Order`, `Reverse
+Order`, and the controls for the chosen mode.
+
+This moves the selected elements relative to *each other*, before the Transform
+above moves them as a group.
+
+- *Spread* pushes them apart from their shared centre. It is a multiplier, not
+  a distance, so 1.0 is exactly no movement and one value works whatever the
+  original spacing was.
+- *Stagger* steps each element along by a fixed amount in `Order`, for a
+  cascade. The first element does not move.
+- *Align* snaps them all to a common edge or centre.
+
+`Order` decides which element counts as first — position, size, reading order,
+or distance from the centre — and also which element sits on top where two
+overlap.
+
+Arrange is unavailable while `Invert Mask` is on. An inverted mask is a
+statement about the whole frame, so there are no individual elements to move.
 
 Two buttons worth knowing about:
 
@@ -224,6 +250,33 @@ function as the host's `HashSource`: FNV-1a is a sequential chain and replaying
 its exact order across thousands of threads costs more than it saves, so the
 device version uses an order-independent combine. The two are never compared
 with each other.
+
+**Arrange switches the composite from one pass to a layered one.** With a
+single transform every destination pixel comes from exactly one place, so the
+frame can be inverse-warped in one go. Once elements move independently that
+stops being true — a pixel could come from any of them, or from two that now
+overlap — so `ElementLayer.h` warps each element and composites it over the
+ones already laid down. Feather becomes per-element too: blurring the combined
+mask and *then* moving pieces of it drags each element's neighbours along in
+its soft edge, which reads as a ghost of the old layout clinging to everything.
+
+Two consequences worth not undoing:
+
+*Settings that mean "no arrangement" must reach the single-pass path.* Spread
+at 1.0, a zero Stagger step, Align with both axes off — `ArrangementMoves`
+checks the computed offsets rather than the mode, and `arrange_identity` tests
+it. This is not about speed: per-element feathering makes the coverages overlap
+slightly, so their sum is no longer exactly the combined mask, and only the
+single-pass path is exact at identity.
+
+*The layer is built in arranged space, without the global transform.*
+Composition is associative, so warping the finished layer gives the same pixels
+as warping each element — but it makes the layer independent of Position, Scale
+and Rotation. Dragging Position re-warps a cached layer instead of rebuilding
+one, and on the GPU path it is the difference between uploading 41 MB per frame
+and uploading it once. The build itself is ~54 ms for 24 elements at UHD and
+runs on the CPU in both paths; the device scatter it would replace is one
+kernel per element with sequential ordering, which is not obviously faster.
 
 **`cuda_parity` is not optional, and it has already earned its place.** A
 `masktest` render proves nothing about the GPU — it runs the CPU shader. The

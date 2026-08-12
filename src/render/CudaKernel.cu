@@ -179,6 +179,22 @@ __global__ void kComposite(const float* src, float* dst, const float* mask, int 
     RenderPixel(sv, pv, params, x, y, dst + dstStride * y + (long long)x * 4);
 }
 
+__global__ void kCompositeLayered(const float* src, float* dst, const float* mask,
+                                  const float* layerColour, const float* layerCoverage, int w,
+                                  int h, long long srcStride, long long dstStride,
+                                  CompositeParams params)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    const ImageView sv{src, w, h, (std::ptrdiff_t)srcStride};
+    const PlaneView pv{mask, w, h};
+    const ImageView lc{layerColour, w, h, (std::ptrdiff_t)w * 4};
+    const PlaneView la{layerCoverage, w, h};
+    RenderPixelLayered(sv, pv, lc, la, params, x, y, dst + dstStride * y + (long long)x * 4);
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------- context
@@ -190,6 +206,9 @@ struct CudaContext {
     DevBuf binA, binB;
     DevBuf fltA;
     DevBuf hash;
+    DevBuf layerColour;    ///< float4 per pixel, arranged space
+    DevBuf layerCoverage;  ///< float per pixel
+    bool hasLayer = false;
     int labelCount = 0;
     int width = 0, height = 0;
 };
@@ -215,7 +234,56 @@ void CudaDestroy(CudaContext* ctx)
     ctx->binB.free();
     ctx->fltA.free();
     ctx->hash.free();
+    ctx->layerColour.free();
+    ctx->layerCoverage.free();
     delete ctx;
+}
+
+bool CudaUploadLayer(CudaContext* ctx, const float* colour, const float* coverage, int width,
+                     int height, void* stream)
+{
+    if (!ctx || !colour || !coverage) return false;
+    const std::size_t n = std::size_t(width) * height;
+    if (!ctx->layerColour.ensure(n * 4 * sizeof(float)) ||
+        !ctx->layerCoverage.ensure(n * sizeof(float)))
+        return false;
+
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    if (!ok(cudaMemcpyAsync(ctx->layerColour.p, colour, n * 4 * sizeof(float),
+                            cudaMemcpyHostToDevice, s)))
+        return false;
+    if (!ok(cudaMemcpyAsync(ctx->layerCoverage.p, coverage, n * sizeof(float),
+                            cudaMemcpyHostToDevice, s)))
+        return false;
+    ctx->hasLayer = true;
+    return true;
+}
+
+void CudaClearLayer(CudaContext* ctx)
+{
+    if (ctx) ctx->hasLayer = false;
+}
+
+bool CudaRenderLayered(CudaContext* ctx, const float* devSrc, float* devDst, int width,
+                       int height, std::ptrdiff_t srcStrideFloats,
+                       std::ptrdiff_t dstStrideFloats, const CompositeParams& params,
+                       void* stream)
+{
+    if (!ctx || !devSrc || !devDst || !ctx->hasLayer) return false;
+
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const dim3 block(16, 16);
+    const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    kCompositeLayered<<<grid, block, 0, s>>>(
+        devSrc, devDst, static_cast<const float*>(ctx->mask.p),
+        static_cast<const float*>(ctx->layerColour.p),
+        static_cast<const float*>(ctx->layerCoverage.p), width, height,
+        (long long)srcStrideFloats, (long long)dstStrideFloats, params);
+
+    if (!ok(cudaGetLastError())) return false;
+    if (!s) return ok(cudaDeviceSynchronize());
+    return true;
 }
 
 std::uint64_t CudaHashSource(CudaContext* ctx, const float* devSrc, int width, int height,
@@ -411,6 +479,41 @@ bool CudaRender(CudaContext* ctx, const float* devSrc, float* devDst, int width,
     // work has to be known finished before the image object is released.
     if (!s) return ok(cudaDeviceSynchronize());
     return true;
+}
+
+bool CudaRenderLayeredHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
+                               const std::uint8_t* selected, int labelCount, int width,
+                               int height, int expand, float feather, bool invert,
+                               const float* layerColour, const float* layerCoverage,
+                               const CompositeParams& params)
+{
+    if (!CudaAvailable()) return false;
+
+    CudaContext* ctx = CudaCreate();
+    if (!ctx) return false;
+
+    const std::size_t px = std::size_t(width) * height;
+    const std::size_t bytes = px * 4 * sizeof(float);
+
+    DevBuf src, dst;
+    bool good = src.ensure(bytes) && dst.ensure(bytes);
+    good = good && ok(cudaMemcpy(src.p, hostSrc, bytes, cudaMemcpyHostToDevice));
+    good = good && CudaUploadLabels(ctx, labels, width, height, nullptr);
+    good = good && CudaUploadSelection(ctx, selected, labelCount, nullptr);
+    // The mask is still needed: it is what the hole and the Preview dim read.
+    good = good && CudaBuildMask(ctx, width, height, expand, feather, invert, nullptr);
+    good = good && CudaUploadLayer(ctx, layerColour, layerCoverage, width, height, nullptr);
+    good = good && CudaRenderLayered(ctx, static_cast<const float*>(src.p),
+                                     static_cast<float*>(dst.p), width, height,
+                                     std::ptrdiff_t(width) * 4, std::ptrdiff_t(width) * 4,
+                                     params, nullptr);
+    good = good && ok(cudaDeviceSynchronize());
+    good = good && ok(cudaMemcpy(hostDst, dst.p, bytes, cudaMemcpyDeviceToHost));
+
+    src.free();
+    dst.free();
+    CudaDestroy(ctx);
+    return good;
 }
 
 bool CudaBench(int width, int height, int expand, float feather, bool invert,

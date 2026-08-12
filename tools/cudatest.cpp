@@ -14,7 +14,9 @@
 #include <cstdlib>
 #include <vector>
 
+#include "core/Arrange.h"
 #include "core/Composite.h"
+#include "core/ElementLayer.h"
 #include "core/MaskBuild.h"
 #include "core/Segmentation.h"
 #include "core/Selection.h"
@@ -30,6 +32,7 @@ struct Case {
   float feather;
   bool invert;
   bool transform;
+  int arrangeMode = am::kArrangeNone;  ///< non-None exercises the layered path
 };
 
 // A synthetic frame with soft edges, holes and elements running off the border.
@@ -92,15 +95,46 @@ int runCase(const Case& c, int w, int h, const std::vector<float>& src,
   std::vector<float> cpu(std::size_t(w) * h * 4, 0.0f);
   const am::PlaneView pv{mask.data(), w, h};
   const am::ImageView sv{src.data(), w, h, std::ptrdiff_t(w) * 4};
-  for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x)
-      am::RenderPixel(sv, pv, cp, x, y, &cpu[(std::size_t(y) * w + x) * 4]);
-
   std::vector<float> gpu(std::size_t(w) * h * 4, 0.0f);
-  if (!am::CudaRenderHostSync(src.data(), gpu.data(), labels.data(), selected.data(), labelCount,
-                              w, h, c.expand, c.feather, c.invert, cp)) {
-    std::fprintf(stderr, "  %-28s CUDA call FAILED\n", c.name);
-    return 1;
+
+  if (c.arrangeMode != am::kArrangeNone) {
+    // The layered path. The layer is built once on the host and fed to both
+    // sides, so what is under test is the combine kernel rather than the
+    // element scatter -- which never runs on the device.
+    am::ArrangeParams ap;
+    ap.mode = c.arrangeMode;
+    ap.spread = 1.8;
+    ap.stepX = 0.05;
+    ap.stepY = -0.03;
+    ap.alignV = am::kAlignMiddle;
+
+    const std::vector<am::Placement> pl =
+        am::ComputeArrangement(seg, sel, ap, float(w), float(h));
+    am::ElementLayer layer;
+    am::BuildElementLayer(sv, seg, pl, mp, am::kFilterBilinear, layer);
+
+    const am::ImageView lc{layer.colour.data(), w, h, std::ptrdiff_t(w) * 4};
+    const am::PlaneView la{layer.coverage.data(), w, h};
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        am::RenderPixelLayered(sv, pv, lc, la, cp, x, y, &cpu[(std::size_t(y) * w + x) * 4]);
+
+    if (!am::CudaRenderLayeredHostSync(src.data(), gpu.data(), labels.data(), selected.data(),
+                                       labelCount, w, h, c.expand, c.feather, c.invert,
+                                       layer.colour.data(), layer.coverage.data(), cp)) {
+      std::fprintf(stderr, "  %-28s CUDA call FAILED\n", c.name);
+      return 1;
+    }
+  } else {
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        am::RenderPixel(sv, pv, cp, x, y, &cpu[(std::size_t(y) * w + x) * 4]);
+
+    if (!am::CudaRenderHostSync(src.data(), gpu.data(), labels.data(), selected.data(),
+                                labelCount, w, h, c.expand, c.feather, c.invert, cp)) {
+      std::fprintf(stderr, "  %-28s CUDA call FAILED\n", c.name);
+      return 1;
+    }
   }
 
   double worst = 0.0;
@@ -160,6 +194,24 @@ int main() {
       {"cutout, transformed", am::kOutCutout, am::kBgRemoved, 4, 6.0f, false, true},
       {"composite, transformed", am::kOutComposite, am::kBgRemoved, 0, 6.0f, false, true},
       {"preview, transformed", am::kOutPreview, am::kBgRemoved, 2, 3.0f, false, true},
+
+      // The layered path, which reads a prebuilt element layer instead of
+      // warping the source. Every output mode again, because each one consumes
+      // the layer differently -- Cutout in particular has to unpremultiply it.
+      {"layered matte", am::kOutMatte, am::kBgRemoved, 0, 6.0f, false, false,
+       am::kArrangeSpread},
+      {"layered cutout", am::kOutCutout, am::kBgRemoved, 0, 6.0f, false, false,
+       am::kArrangeSpread},
+      {"layered cutout premult", am::kOutCutoutPM, am::kBgRemoved, 3, 6.0f, false, false,
+       am::kArrangeStagger},
+      {"layered preview", am::kOutPreview, am::kBgRemoved, 0, 4.0f, false, false,
+       am::kArrangeStagger},
+      {"layered composite", am::kOutComposite, am::kBgRemoved, 0, 8.0f, false, false,
+       am::kArrangeSpread},
+      {"layered composite, left", am::kOutComposite, am::kBgLeft, 0, 5.0f, false, false,
+       am::kArrangeAlign},
+      {"layered + transform", am::kOutComposite, am::kBgRemoved, 2, 5.0f, false, true,
+       am::kArrangeSpread},
   };
 
   int failures = 0;

@@ -42,6 +42,15 @@ constexpr const char* kParamAnchorToSel    = "anchorToSelection";
 constexpr const char* kParamAutoCenter     = "autoCenter";
 constexpr const char* kParamFilter         = "filterMode";
 
+// --- Arrange -----------------------------------------------------------------
+constexpr const char* kParamArrangeMode    = "arrangeMode";
+constexpr const char* kParamArrangeOrder   = "arrangeOrder";
+constexpr const char* kParamArrangeReverse = "arrangeReverse";
+constexpr const char* kParamSpread         = "arrangeSpread";
+constexpr const char* kParamStep           = "arrangeStep";
+constexpr const char* kParamAlignH         = "arrangeAlignH";
+constexpr const char* kParamAlignV         = "arrangeAlignV";
+
 // --- About -------------------------------------------------------------------
 constexpr const char* kParamOverlayHint    = "overlayHint";
 

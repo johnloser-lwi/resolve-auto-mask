@@ -109,9 +109,15 @@ class BandRenderer : public OFX::MultiThread::Processor
 {
 public:
     BandRenderer(const ImageView& src, const MutableImageView& dst, const PlaneView& mask,
-                 const CompositeParams& cp, const RectI& window)
-        : _src(src), _dst(dst), _mask(mask), _cp(cp), _window(window)
+                 const CompositeParams& cp, const RectI& window, const ElementLayer* layer)
+        : _src(src), _dst(dst), _mask(mask), _cp(cp), _window(window), _layer(layer)
     {
+        if (_layer)
+        {
+            _layerColour = ImageView{_layer->colour.data(), _layer->width, _layer->height,
+                                     std::ptrdiff_t(_layer->width) * 4};
+            _layerCoverage = PlaneView{_layer->coverage.data(), _layer->width, _layer->height};
+        }
     }
 
     void multiThreadFunction(unsigned int threadID, unsigned int nThreads) override
@@ -119,6 +125,20 @@ public:
         const int h = _window.height();
         const int y0 = _window.y1 + int(std::size_t(threadID) * h / nThreads);
         const int y1 = _window.y1 + int(std::size_t(threadID + 1) * h / nThreads);
+
+        // Hoisted out of the pixel loop: whether the elements move
+        // independently is a property of the frame, not of the pixel.
+        if (_layer)
+        {
+            for (int y = y0; y < y1; ++y)
+            {
+                float* row = _dst.row(y);
+                for (int x = _window.x1; x < _window.x2; ++x)
+                    RenderPixelLayered(_src, _mask, _layerColour, _layerCoverage, _cp, x, y,
+                                       row + std::ptrdiff_t(x) * 4);
+            }
+            return;
+        }
 
         for (int y = y0; y < y1; ++y)
         {
@@ -134,6 +154,9 @@ private:
     const PlaneView& _mask;
     const CompositeParams& _cp;
     RectI _window;
+    const ElementLayer* _layer;
+    ImageView _layerColour;
+    PlaneView _layerCoverage;
 };
 
 }  // namespace
@@ -172,6 +195,14 @@ AutoMaskPlugin::AutoMaskPlugin(OfxImageEffectHandle p_Handle)
     _xfAnchor    = fetchDouble2DParam(kParamXfAnchor);
     _anchorToSel = fetchPushButtonParam(kParamAnchorToSel);
     _autoCenter  = fetchPushButtonParam(kParamAutoCenter);
+
+    _arrangeMode    = fetchChoiceParam(kParamArrangeMode);
+    _arrangeOrder   = fetchChoiceParam(kParamArrangeOrder);
+    _arrangeReverse = fetchBooleanParam(kParamArrangeReverse);
+    _spread         = fetchDoubleParam(kParamSpread);
+    _step           = fetchDouble2DParam(kParamStep);
+    _alignH         = fetchChoiceParam(kParamAlignH);
+    _alignV         = fetchChoiceParam(kParamAlignV);
     _filter      = fetchChoiceParam(kParamFilter);
 
     // The published documentation for Resolve's OFX host is thin and partly
@@ -215,7 +246,62 @@ AutoMaskPlugin::FrameParams AutoMaskPlugin::ReadFrameParams(double time) const
     // cannot show a number that is not in force.
     f.scaleY = BoolAt(_xfLink, time) ? f.scaleX : DoubleAt(_xfScaleY, time);
     f.rotation = DoubleAt(_xfRot, time);
+
+    f.arrange.mode = ChoiceAt(_arrangeMode, time);
+    f.arrange.order = ChoiceAt(_arrangeOrder, time);
+    f.arrange.reverse = BoolAt(_arrangeReverse, time);
+    f.arrange.spread = DoubleAt(_spread, time);
+    Double2DAt(_step, time, f.arrange.stepX, f.arrange.stepY);
+    f.arrange.alignH = ChoiceAt(_alignH, time);
+    f.arrange.alignV = ChoiceAt(_alignV, time);
+
+    // Invert Mask and Arrange are mutually exclusive, and forcing it here
+    // rather than trusting the UI keeps the two paths honest.
+    //
+    // An inverted mask is a statement about the whole frame -- everything
+    // except the selection -- and that is not something individual elements can
+    // each carry a piece of. There is no sensible answer to "move this element
+    // and also invert", so the arrangement is dropped rather than producing one.
+    if (f.mask.invert) f.arrange.mode = kArrangeNone;
     return f;
+}
+
+std::shared_ptr<const am::ElementLayer> AutoMaskPlugin::LayerFor(
+    const ImageView& src, const std::shared_ptr<const Segmentation>& seg,
+    const std::string& points, const FrameParams& fp) const
+{
+    std::lock_guard<std::mutex> lock(_layerCache.mutex);
+    if (_layerCache.valid && _layerCache.seg == seg && _layerCache.points == points &&
+        _layerCache.maskParams == fp.mask && _layerCache.arrangeParams == fp.arrange)
+        return _layerCache.layer;
+
+    std::shared_ptr<const ElementLayer> built;
+    if (fp.arrange.mode != kArrangeNone && seg && !seg->empty())
+    {
+        const Resolved sel = ResolveSelection(*seg, ParseAnchors(points));
+        const std::vector<Placement> placements = ComputeArrangement(
+            *seg, sel, fp.arrange, float(seg->width), float(seg->height));
+
+        // Settings that mean "no arrangement" -- Spread at 1.0, a zero step,
+        // Align with both axes off -- must reach the single-pass path. Only
+        // that path is exact at identity, because per-element feathering makes
+        // the element coverages overlap slightly and their sum is no longer
+        // exactly the combined mask.
+        if (ArrangementMoves(placements))
+        {
+            auto layer = std::make_shared<ElementLayer>();
+            BuildElementLayer(src, *seg, placements, fp.mask, fp.filter, *layer);
+            built = layer;
+        }
+    }
+
+    _layerCache.seg = seg;
+    _layerCache.points = points;
+    _layerCache.maskParams = fp.mask;
+    _layerCache.arrangeParams = fp.arrange;
+    _layerCache.layer = built;
+    _layerCache.valid = true;
+    return built;
 }
 
 am::CompositeParams AutoMaskPlugin::FrameParams::composite(float w, float h) const
@@ -360,7 +446,9 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     if (window.empty()) return;
 
     const PlaneView plane{mask->data(), seg->width, seg->height};
-    BandRenderer renderer(srcView, dstView, plane, cp, window);
+    const std::shared_ptr<const ElementLayer> layer = LayerFor(srcView, seg, points, fp);
+
+    BandRenderer renderer(srcView, dstView, plane, cp, window, layer.get());
     renderer.multiThread();
 
     // Deliberately NOT updating the status read-out here. Writing a parameter
@@ -465,11 +553,55 @@ bool AutoMaskPlugin::renderCuda(const OFX::RenderArguments& p_Args, OFX::Image* 
         _cudaMaskValid = true;
     }
 
+    // --- the arranged element layer -----------------------------------------
+    //
+    // Built on the host, which needs host pixels. _downloadBuf already holds
+    // them for the current content -- it is only refilled when the hash says
+    // the content changed -- but a CPU render earlier in the session could have
+    // filled the analysis cache without ever filling it, so check rather than
+    // assume.
+    std::shared_ptr<const ElementLayer> layer;
+    if (fp.arrange.mode != kArrangeNone)
+    {
+        if (_downloadBuf.size() != std::size_t(w) * h * 4)
+        {
+            _downloadBuf.resize(std::size_t(w) * h * 4);
+            if (!CudaDownload(_cuda, srcBase, w, h, srcStride, _downloadBuf.data(), stream))
+                return false;
+        }
+        const ImageView topDown{_downloadBuf.data() + std::size_t(h - 1) * w * 4, w, h,
+                                -std::ptrdiff_t(w) * 4};
+        layer = LayerFor(topDown, seg, points, fp);
+    }
+
+    if (layer)
+    {
+        // Uploaded only when the layer object itself changes. It is built in
+        // arranged space, so Position, Scale and Rotation do not touch it.
+        if (_cudaLayer != layer)
+        {
+            if (!CudaUploadLayer(_cuda, layer->colour.data(), layer->coverage.data(), w, h,
+                                 stream))
+                return false;
+            _cudaLayer = layer;
+        }
+    }
+    else if (_cudaLayer)
+    {
+        CudaClearLayer(_cuda);
+        _cudaLayer.reset();
+    }
+
     // Top-down views of both images, as negative strides from the last row, so
     // the kernel indexes the same space the label image and mask are in.
     const CompositeParams cp = fp.composite(float(w), float(h));
-    return CudaRender(_cuda, srcBase + srcStride * (h - 1), dstBase + dstStride * (h - 1), w, h,
-                      -srcStride, -dstStride, cp, stream);
+    const float* srcTop = srcBase + srcStride * (h - 1);
+    float* dstTop = dstBase + dstStride * (h - 1);
+
+    if (layer)
+        return CudaRenderLayered(_cuda, srcTop, dstTop, w, h, -srcStride, -dstStride, cp,
+                                 stream);
+    return CudaRender(_cuda, srcTop, dstTop, w, h, -srcStride, -dstStride, cp, stream);
 }
 
 #else
@@ -486,7 +618,8 @@ void AutoMaskPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args,
     try
     {
         if (p_ParamName == kParamXfLink || p_ParamName == kParamSegMode ||
-            p_ParamName == kParamOutputMode)
+            p_ParamName == kParamOutputMode || p_ParamName == kParamArrangeMode ||
+            p_ParamName == kParamInvertMask)
         {
             syncVisibility();
             return;
@@ -607,6 +740,26 @@ void AutoMaskPlugin::syncVisibility()
             int out = kOutMatte;
             _outputMode->getValue(out);
             _leaveOriginal->setIsSecret(out != kOutComposite);
+        }
+
+        {
+            int mode = kArrangeNone;
+            if (_arrangeMode) _arrangeMode->getValue(mode);
+            bool inverted = false;
+            if (_invertMask) _invertMask->getValue(inverted);
+
+            // Arrange cannot mean anything against an inverted mask, so the
+            // whole section goes rather than sitting there doing nothing. The
+            // read side forces it off too -- this only stops the panel showing
+            // controls that are not in force.
+            const bool off = inverted || mode == kArrangeNone;
+            if (_arrangeOrder) _arrangeOrder->setIsSecret(off);
+            if (_arrangeReverse) _arrangeReverse->setIsSecret(off);
+            if (_spread) _spread->setIsSecret(inverted || mode != kArrangeSpread);
+            if (_step) _step->setIsSecret(inverted || mode != kArrangeStagger);
+            if (_alignH) _alignH->setIsSecret(inverted || mode != kArrangeAlign);
+            if (_alignV) _alignV->setIsSecret(inverted || mode != kArrangeAlign);
+            if (_arrangeMode) _arrangeMode->setEnabled(!inverted);
         }
     }
     catch (...)
@@ -1058,6 +1211,81 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
         filt->setAnimates(false);
         filt->setParent(*g);
         AddParam(page, filt);
+    }
+
+    // --- Arrange -------------------------------------------------------------
+    {
+        OFX::GroupParamDescriptor* g = DefineGroup(p_Desc, page, "grpArrange", "Arrange");
+
+        OFX::ChoiceParamDescriptor* mode = p_Desc.defineChoiceParam(kParamArrangeMode);
+        mode->setLabels("Mode", "Mode", "Mode");
+        mode->setHint(
+            "Moves the selected elements relative to EACH OTHER, before the Transform above "
+            "moves them as a group. Spread pushes them apart from their shared centre. "
+            "Stagger steps each one along by a fixed amount, in the chosen Order, for a "
+            "cascade. Align snaps them to a common edge or centre. Unavailable while Invert "
+            "Mask is on, since there are no individual elements to move in an inverted mask.");
+        mode->appendOption("None");
+        mode->appendOption("Spread");
+        mode->appendOption("Stagger");
+        mode->appendOption("Align");
+        mode->setDefault(kArrangeNone);
+        mode->setParent(*g);
+        AddParam(page, mode);
+
+        OFX::ChoiceParamDescriptor* order = p_Desc.defineChoiceParam(kParamArrangeOrder);
+        order->setLabels("Order", "Order", "Order");
+        order->setHint(
+            "Which element counts as first. Drives the Stagger step, and decides which "
+            "element sits on top where two of them overlap.");
+        order->appendOption("Left to Right");
+        order->appendOption("Right to Left");
+        order->appendOption("Top to Bottom");
+        order->appendOption("Bottom to Top");
+        order->appendOption("Reading Order");
+        order->appendOption("Largest First");
+        order->appendOption("Smallest First");
+        order->appendOption("Nearest Centre First");
+        order->setDefault(kOrderLeftRight);
+        order->setParent(*g);
+        AddParam(page, order);
+
+        DefineBool(p_Desc, page, g, kParamArrangeReverse, "Reverse Order",
+                   "Flips the order end for end, so a cascade runs the other way.", false);
+
+        DefineDouble(p_Desc, page, g, kParamSpread, "Spread",
+                     "How far apart to push the elements, as a multiple of their existing "
+                     "distance from the shared centre. 1.0 leaves them exactly where they "
+                     "are; 2.0 doubles every gap. Being a multiplier rather than a distance, "
+                     "one value works whatever the spacing was.",
+                     1.0, -100.0, 100.0, 0.0, 4.0, 0.01);
+
+        DefineXY(p_Desc, page, g, kParamStep, "Step",
+                 "How far each element moves past the one before it, as a fraction of the "
+                 "frame. The first element in the Order does not move at all.",
+                 0.0, 0.0, -0.5, 0.5);
+
+        OFX::ChoiceParamDescriptor* ah = p_Desc.defineChoiceParam(kParamAlignH);
+        ah->setLabels("Align Horizontal", "Align Horizontal", "Align Horizontal");
+        ah->setHint("Snaps every element to the same left edge, centre, or right edge.");
+        ah->appendOption("None");
+        ah->appendOption("Left");
+        ah->appendOption("Center");
+        ah->appendOption("Right");
+        ah->setDefault(kAlignHNone);
+        ah->setParent(*g);
+        AddParam(page, ah);
+
+        OFX::ChoiceParamDescriptor* av = p_Desc.defineChoiceParam(kParamAlignV);
+        av->setLabels("Align Vertical", "Align Vertical", "Align Vertical");
+        av->setHint("Snaps every element to the same top, middle, or bottom.");
+        av->appendOption("None");
+        av->appendOption("Top");
+        av->appendOption("Middle");
+        av->appendOption("Bottom");
+        av->setDefault(kAlignVNone);
+        av->setParent(*g);
+        AddParam(page, av);
     }
 
     // --- About ---------------------------------------------------------------

@@ -17,8 +17,10 @@
 #include <string>
 #include <vector>
 
+#include "core/Arrange.h"
 #include "core/AutoCenter.h"
 #include "core/Composite.h"
+#include "core/ElementLayer.h"
 #include "core/MaskBuild.h"
 #include "core/Segmentation.h"
 #include "core/Selection.h"
@@ -45,6 +47,9 @@ struct Options {
   bool autoCenter = false;
   bool centerCheck = false;
   int bench = 0;
+  am::ArrangeParams arrange;
+  bool printOrder = false;
+  std::string expectOrder;
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -133,6 +138,51 @@ Options parseArgs(int argc, char** argv) {
       o.centerCheck = true;
     } else if (eq(a, "--bench")) {
       o.bench = std::atoi(next());
+    } else if (eq(a, "--arrange")) {
+      const char* v = next();
+      if (eq(v, "none")) o.arrange.mode = am::kArrangeNone;
+      else if (eq(v, "spread")) o.arrange.mode = am::kArrangeSpread;
+      else if (eq(v, "stagger")) o.arrange.mode = am::kArrangeStagger;
+      else if (eq(v, "align")) o.arrange.mode = am::kArrangeAlign;
+      else die("--arrange must be none|spread|stagger|align");
+    } else if (eq(a, "--order")) {
+      const char* v = next();
+      if (eq(v, "lr")) o.arrange.order = am::kOrderLeftRight;
+      else if (eq(v, "rl")) o.arrange.order = am::kOrderRightLeft;
+      else if (eq(v, "tb")) o.arrange.order = am::kOrderTopBottom;
+      else if (eq(v, "bt")) o.arrange.order = am::kOrderBottomTop;
+      else if (eq(v, "reading")) o.arrange.order = am::kOrderReading;
+      else if (eq(v, "largest")) o.arrange.order = am::kOrderLargest;
+      else if (eq(v, "smallest")) o.arrange.order = am::kOrderSmallest;
+      else if (eq(v, "radial")) o.arrange.order = am::kOrderRadial;
+      else die("--order must be lr|rl|tb|bt|reading|largest|smallest|radial");
+    } else if (eq(a, "--reverse")) {
+      o.arrange.reverse = true;
+    } else if (eq(a, "--spread")) {
+      o.arrange.spread = std::atof(next());
+    } else if (eq(a, "--step")) {
+      float sx = 0.0f, sy = 0.0f;
+      parsePair(next(), sx, sy);
+      o.arrange.stepX = sx;
+      o.arrange.stepY = sy;
+    } else if (eq(a, "--align-h")) {
+      const char* v = next();
+      if (eq(v, "none")) o.arrange.alignH = am::kAlignHNone;
+      else if (eq(v, "left")) o.arrange.alignH = am::kAlignLeft;
+      else if (eq(v, "center")) o.arrange.alignH = am::kAlignCenterH;
+      else if (eq(v, "right")) o.arrange.alignH = am::kAlignRight;
+      else die("--align-h must be none|left|center|right");
+    } else if (eq(a, "--align-v")) {
+      const char* v = next();
+      if (eq(v, "none")) o.arrange.alignV = am::kAlignVNone;
+      else if (eq(v, "top")) o.arrange.alignV = am::kAlignTop;
+      else if (eq(v, "middle")) o.arrange.alignV = am::kAlignMiddle;
+      else if (eq(v, "bottom")) o.arrange.alignV = am::kAlignBottom;
+      else die("--align-v must be none|top|middle|bottom");
+    } else if (eq(a, "--print-order")) {
+      o.printOrder = true;
+    } else if (eq(a, "--expect-order")) {
+      o.expectOrder = next();
     } else {
       die(std::string("unknown option ") + a);
     }
@@ -285,9 +335,49 @@ int main(int argc, char** argv) {
 
   const am::PlaneView plane{mask.data(), seg.width, seg.height};
   std::vector<float> out(std::size_t(seg.width) * seg.height * 4, 0.0f);
-  for (int y = 0; y < seg.height; ++y)
-    for (int x = 0; x < seg.width; ++x)
-      am::RenderPixel(src, plane, cp, x, y, &out[(std::size_t(y) * seg.width + x) * 4]);
+
+  const std::vector<am::Placement> placements =
+      am::ComputeArrangement(seg, sel, o.arrange, w, h);
+
+  if (o.printOrder) {
+    std::printf("arrangement order (%zu elements):\n", placements.size());
+    for (const am::Placement& p : placements)
+      std::printf("  %2d  label %-3d  bbox[%d,%d %dx%d]  offset (%+.1f, %+.1f)\n", p.index,
+                  p.label, p.bbox.x1, p.bbox.y1, p.bbox.width(), p.bbox.height(), p.dx, p.dy);
+  }
+
+  if (!o.expectOrder.empty()) {
+    std::string got;
+    for (const am::Placement& p : placements) {
+      if (!got.empty()) got += ",";
+      got += std::to_string(p.label);
+    }
+    if (got != o.expectOrder) {
+      std::fprintf(stderr, "masktest: order was \"%s\", expected \"%s\"\n", got.c_str(),
+                   o.expectOrder.c_str());
+      return 1;
+    }
+    std::printf("order ok: %s\n", got.c_str());
+  }
+
+  if (am::ArrangementMoves(placements)) {
+    // Layered: each element shifted and stacked, then the global transform
+    // applied to the finished layer by the combine. See ElementLayer.h.
+    am::ElementLayer layer;
+    am::BuildElementLayer(src, seg, placements, o.mask, o.filter, layer);
+
+    const am::ImageView lc{layer.colour.data(), seg.width, seg.height,
+                           std::ptrdiff_t(seg.width) * 4};
+    const am::PlaneView la{layer.coverage.data(), seg.width, seg.height};
+    for (int y = 0; y < seg.height; ++y)
+      for (int x = 0; x < seg.width; ++x)
+        am::RenderPixelLayered(src, plane, lc, la, cp, x, y,
+                               &out[(std::size_t(y) * seg.width + x) * 4]);
+  } else {
+    for (int y = 0; y < seg.height; ++y)
+      for (int x = 0; x < seg.width; ++x)
+        am::RenderPixel(src, plane, cp, x, y, &out[(std::size_t(y) * seg.width + x) * 4]);
+  }
 
   // The regression test for the recombination algebra in Composite.h. A
   // composite with the transform at defaults must return the source untouched,
