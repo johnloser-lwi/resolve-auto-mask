@@ -43,7 +43,6 @@ constexpr const char* kParamAutoCenter     = "autoCenter";
 constexpr const char* kParamFilter         = "filterMode";
 
 // --- Arrange -----------------------------------------------------------------
-constexpr const char* kParamArrangeMode    = "arrangeMode";
 constexpr const char* kParamArrangeOrder   = "arrangeOrder";
 constexpr const char* kParamArrangeReverse = "arrangeReverse";
 constexpr const char* kParamSpread         = "arrangeSpread";

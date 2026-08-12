@@ -175,13 +175,13 @@ add_test(NAME auto_center
 # orders agreed would not be testing much.
 add_test(NAME arrange_order_lr
          COMMAND masktest "${TESTDATA}/three_shapes.png" --select-all
-                 --arrange stagger --order lr --step 0.05,0 --expect-order "1,3,2")
+                 --order lr --step 0.05,0 --expect-order "1,3,2")
 add_test(NAME arrange_order_largest
          COMMAND masktest "${TESTDATA}/three_shapes.png" --select-all
-                 --arrange stagger --order largest --step 0.05,0 --expect-order "2,1,3")
+                 --order largest --step 0.05,0 --expect-order "2,1,3")
 add_test(NAME arrange_order_reverse
          COMMAND masktest "${TESTDATA}/three_shapes.png" --select-all
-                 --arrange stagger --order lr --reverse --step 0.05,0 --expect-order "2,3,1")
+                 --order lr --reverse --step 0.05,0 --expect-order "2,3,1")
 
 # Settings that mean "no arrangement" must reach the SINGLE-PASS path, not the
 # layered one. Not merely for speed: only the single-pass path has the exact
@@ -190,7 +190,14 @@ add_test(NAME arrange_order_reverse
 add_test(NAME arrange_identity
          COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/arrange_identity.png"
                  --select-all --output composite --feather 8
-                 --arrange spread --spread 1.0 --identity-check)
+                 --spread 1.0,1.0 --identity-check)
+
+# Align and Step COMPOSE. A left-aligned column is the case an exclusive mode
+# could not express, and the one that motivated dropping it.
+add_test(NAME arrange_align_and_step
+         COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/align_step.png"
+                 --select-all --output preview --align-h left --step 0,-0.15
+                 --order tb --expect-order "1,2,3")
 
 # CPU/GPU parity. Skips itself, rather than failing, on a machine with no GPU.
 if(AUTOMASK_HAVE_CUDA)

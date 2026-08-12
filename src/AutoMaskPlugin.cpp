@@ -196,10 +196,9 @@ AutoMaskPlugin::AutoMaskPlugin(OfxImageEffectHandle p_Handle)
     _anchorToSel = fetchPushButtonParam(kParamAnchorToSel);
     _autoCenter  = fetchPushButtonParam(kParamAutoCenter);
 
-    _arrangeMode    = fetchChoiceParam(kParamArrangeMode);
     _arrangeOrder   = fetchChoiceParam(kParamArrangeOrder);
     _arrangeReverse = fetchBooleanParam(kParamArrangeReverse);
-    _spread         = fetchDoubleParam(kParamSpread);
+    _spread         = fetchDouble2DParam(kParamSpread);
     _step           = fetchDouble2DParam(kParamStep);
     _alignH         = fetchChoiceParam(kParamAlignH);
     _alignV         = fetchChoiceParam(kParamAlignV);
@@ -247,13 +246,12 @@ AutoMaskPlugin::FrameParams AutoMaskPlugin::ReadFrameParams(double time) const
     f.scaleY = BoolAt(_xfLink, time) ? f.scaleX : DoubleAt(_xfScaleY, time);
     f.rotation = DoubleAt(_xfRot, time);
 
-    f.arrange.mode = ChoiceAt(_arrangeMode, time);
     f.arrange.order = ChoiceAt(_arrangeOrder, time);
     f.arrange.reverse = BoolAt(_arrangeReverse, time);
-    f.arrange.spread = DoubleAt(_spread, time);
-    Double2DAt(_step, time, f.arrange.stepX, f.arrange.stepY);
     f.arrange.alignH = ChoiceAt(_alignH, time);
     f.arrange.alignV = ChoiceAt(_alignV, time);
+    Double2DAt(_spread, time, f.arrange.spreadX, f.arrange.spreadY);
+    Double2DAt(_step, time, f.arrange.stepX, f.arrange.stepY);
 
     // Invert Mask and Arrange are mutually exclusive, and forcing it here
     // rather than trusting the UI keeps the two paths honest.
@@ -262,7 +260,7 @@ AutoMaskPlugin::FrameParams AutoMaskPlugin::ReadFrameParams(double time) const
     // except the selection -- and that is not something individual elements can
     // each carry a piece of. There is no sensible answer to "move this element
     // and also invert", so the arrangement is dropped rather than producing one.
-    if (f.mask.invert) f.arrange.mode = kArrangeNone;
+    if (f.mask.invert) f.arrange = ArrangeParams{};
     return f;
 }
 
@@ -276,17 +274,19 @@ std::shared_ptr<const am::ElementLayer> AutoMaskPlugin::LayerFor(
         return _layerCache.layer;
 
     std::shared_ptr<const ElementLayer> built;
-    if (fp.arrange.mode != kArrangeNone && seg && !seg->empty())
+    if (seg && !seg->empty())
     {
         const Resolved sel = ResolveSelection(*seg, ParseAnchors(points));
         const std::vector<Placement> placements = ComputeArrangement(
             *seg, sel, fp.arrange, float(seg->width), float(seg->height));
 
-        // Settings that mean "no arrangement" -- Spread at 1.0, a zero step,
-        // Align with both axes off -- must reach the single-pass path. Only
-        // that path is exact at identity, because per-element feathering makes
-        // the element coverages overlap slightly and their sum is no longer
-        // exactly the combined mask.
+        // Settings that mean "no arrangement" -- Spread at 1,1, a zero Step,
+        // Align with both axes off -- must reach the single-pass path. Checked
+        // from the computed offsets rather than from the controls, since with
+        // three composable operations there are many ways to say "nothing".
+        // Only that path is exact at identity, because per-element feathering
+        // makes the element coverages overlap slightly and their sum is no
+        // longer exactly the combined mask.
         if (ArrangementMoves(placements))
         {
             auto layer = std::make_shared<ElementLayer>();
@@ -560,18 +560,29 @@ bool AutoMaskPlugin::renderCuda(const OFX::RenderArguments& p_Args, OFX::Image* 
     // the content changed -- but a CPU render earlier in the session could have
     // filled the analysis cache without ever filling it, so check rather than
     // assume.
+    //
+    // The cheap guard first: with three composable operations there is no
+    // single "is Arrange on" flag, so ask the arrangement itself whether
+    // anything actually moves before paying for host pixels. It is a sort over
+    // a handful of elements, not a pass over the frame.
     std::shared_ptr<const ElementLayer> layer;
-    if (fp.arrange.mode != kArrangeNone)
     {
-        if (_downloadBuf.size() != std::size_t(w) * h * 4)
+        const Resolved sel = ResolveSelection(*seg, ParseAnchors(points));
+        const bool moves = ArrangementMoves(
+            ComputeArrangement(*seg, sel, fp.arrange, float(w), float(h)));
+
+        if (moves && _downloadBuf.size() != std::size_t(w) * h * 4)
         {
             _downloadBuf.resize(std::size_t(w) * h * 4);
             if (!CudaDownload(_cuda, srcBase, w, h, srcStride, _downloadBuf.data(), stream))
                 return false;
         }
-        const ImageView topDown{_downloadBuf.data() + std::size_t(h - 1) * w * 4, w, h,
-                                -std::ptrdiff_t(w) * 4};
-        layer = LayerFor(topDown, seg, points, fp);
+        if (moves)
+        {
+            const ImageView topDown{_downloadBuf.data() + std::size_t(h - 1) * w * 4, w, h,
+                                    -std::ptrdiff_t(w) * 4};
+            layer = LayerFor(topDown, seg, points, fp);
+        }
     }
 
     if (layer)
@@ -618,8 +629,7 @@ void AutoMaskPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args,
     try
     {
         if (p_ParamName == kParamXfLink || p_ParamName == kParamSegMode ||
-            p_ParamName == kParamOutputMode || p_ParamName == kParamArrangeMode ||
-            p_ParamName == kParamInvertMask)
+            p_ParamName == kParamOutputMode || p_ParamName == kParamInvertMask)
         {
             syncVisibility();
             return;
@@ -743,23 +753,20 @@ void AutoMaskPlugin::syncVisibility()
         }
 
         {
-            int mode = kArrangeNone;
-            if (_arrangeMode) _arrangeMode->getValue(mode);
             bool inverted = false;
             if (_invertMask) _invertMask->getValue(inverted);
 
             // Arrange cannot mean anything against an inverted mask, so the
-            // whole section goes rather than sitting there doing nothing. The
-            // read side forces it off too -- this only stops the panel showing
-            // controls that are not in force.
-            const bool off = inverted || mode == kArrangeNone;
-            if (_arrangeOrder) _arrangeOrder->setIsSecret(off);
-            if (_arrangeReverse) _arrangeReverse->setIsSecret(off);
-            if (_spread) _spread->setIsSecret(inverted || mode != kArrangeSpread);
-            if (_step) _step->setIsSecret(inverted || mode != kArrangeStagger);
-            if (_alignH) _alignH->setIsSecret(inverted || mode != kArrangeAlign);
-            if (_alignV) _alignV->setIsSecret(inverted || mode != kArrangeAlign);
-            if (_arrangeMode) _arrangeMode->setEnabled(!inverted);
+            // whole section is disabled rather than sitting there doing
+            // nothing. Disabled rather than hidden: the controls hold values
+            // the user set, and making them vanish looks like losing them.
+            // The read side forces the arrangement off regardless.
+            if (_arrangeOrder) _arrangeOrder->setEnabled(!inverted);
+            if (_arrangeReverse) _arrangeReverse->setEnabled(!inverted);
+            if (_alignH) _alignH->setEnabled(!inverted);
+            if (_alignV) _alignV->setEnabled(!inverted);
+            if (_spread) _spread->setEnabled(!inverted);
+            if (_step) _step->setEnabled(!inverted);
         }
     }
     catch (...)
@@ -1217,27 +1224,16 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
     {
         OFX::GroupParamDescriptor* g = DefineGroup(p_Desc, page, "grpArrange", "Arrange");
 
-        OFX::ChoiceParamDescriptor* mode = p_Desc.defineChoiceParam(kParamArrangeMode);
-        mode->setLabels("Mode", "Mode", "Mode");
-        mode->setHint(
-            "Moves the selected elements relative to EACH OTHER, before the Transform above "
-            "moves them as a group. Spread pushes them apart from their shared centre. "
-            "Stagger steps each one along by a fixed amount, in the chosen Order, for a "
-            "cascade. Align snaps them to a common edge or centre. Unavailable while Invert "
-            "Mask is on, since there are no individual elements to move in an inverted mask.");
-        mode->appendOption("None");
-        mode->appendOption("Spread");
-        mode->appendOption("Stagger");
-        mode->appendOption("Align");
-        mode->setDefault(kArrangeNone);
-        mode->setParent(*g);
-        AddParam(page, mode);
-
+        // No mode selector. Align, Spread and Step compose -- a left-aligned
+        // vertical stack is Align plus Step, and an exclusive mode makes that
+        // impossible to say. Each has a neutral default, so "off" needs no
+        // separate control. They apply in that order: line them up, push them
+        // apart, march them along.
         OFX::ChoiceParamDescriptor* order = p_Desc.defineChoiceParam(kParamArrangeOrder);
         order->setLabels("Order", "Order", "Order");
         order->setHint(
-            "Which element counts as first. Drives the Stagger step, and decides which "
-            "element sits on top where two of them overlap.");
+            "Which element counts as first. Drives the Step, and decides which element sits "
+            "on top where two of them overlap.");
         order->appendOption("Left to Right");
         order->appendOption("Right to Left");
         order->appendOption("Top to Bottom");
@@ -1252,18 +1248,6 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
 
         DefineBool(p_Desc, page, g, kParamArrangeReverse, "Reverse Order",
                    "Flips the order end for end, so a cascade runs the other way.", false);
-
-        DefineDouble(p_Desc, page, g, kParamSpread, "Spread",
-                     "How far apart to push the elements, as a multiple of their existing "
-                     "distance from the shared centre. 1.0 leaves them exactly where they "
-                     "are; 2.0 doubles every gap. Being a multiplier rather than a distance, "
-                     "one value works whatever the spacing was.",
-                     1.0, -100.0, 100.0, 0.0, 4.0, 0.01);
-
-        DefineXY(p_Desc, page, g, kParamStep, "Step",
-                 "How far each element moves past the one before it, as a fraction of the "
-                 "frame. The first element in the Order does not move at all.",
-                 0.0, 0.0, -0.5, 0.5);
 
         OFX::ChoiceParamDescriptor* ah = p_Desc.defineChoiceParam(kParamAlignH);
         ah->setLabels("Align Horizontal", "Align Horizontal", "Align Horizontal");
@@ -1286,6 +1270,20 @@ void AutoMaskPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc
         av->setDefault(kAlignVNone);
         av->setParent(*g);
         AddParam(page, av);
+
+        DefineXY(p_Desc, page, g, kParamSpread, "Spread",
+                 "Pushes the elements apart from their shared centre, per axis. 1.0 leaves "
+                 "them where they are; 2.0 doubles every gap; below 1.0 pulls them together. "
+                 "A multiplier rather than a distance, so one value works whatever the "
+                 "original spacing was -- but for the same reason it cannot separate elements "
+                 "that already sit on top of each other. Use Step for that.",
+                 1.0, 1.0, 0.0, 4.0);
+
+        DefineXY(p_Desc, page, g, kParamStep, "Step",
+                 "Moves each element one further increment than the one before it, in the "
+                 "chosen Order, as a fraction of the frame. The first element does not move. "
+                 "This is what turns an aligned pile into an evenly spaced row or column.",
+                 0.0, 0.0, -0.5, 0.5);
     }
 
     // --- About ---------------------------------------------------------------

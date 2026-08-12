@@ -178,10 +178,9 @@ private:
     OFX::PushButtonParam* _anchorToSel = nullptr;
     OFX::PushButtonParam* _autoCenter  = nullptr;
 
-    OFX::ChoiceParam*   _arrangeMode    = nullptr;
     OFX::ChoiceParam*   _arrangeOrder   = nullptr;
     OFX::BooleanParam*  _arrangeReverse = nullptr;
-    OFX::DoubleParam*   _spread         = nullptr;
+    OFX::Double2DParam* _spread         = nullptr;
     OFX::Double2DParam* _step           = nullptr;
     OFX::ChoiceParam*   _alignH         = nullptr;
     OFX::ChoiceParam*   _alignV         = nullptr;

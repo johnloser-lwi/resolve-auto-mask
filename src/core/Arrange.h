@@ -18,14 +18,18 @@
 
 namespace am {
 
-enum ArrangeMode {
-  kArrangeNone = 0,
-  kArrangeSpread = 1,   ///< push out from the selection centre
-  kArrangeStagger = 2,  ///< a fixed step per element, in order
-  kArrangeAlign = 3     ///< snap to a common edge or centre
-};
+// Align, Spread and Step COMPOSE. They were originally an exclusive Mode, and
+// that was wrong: the obvious thing to want is a row of items snapped to a
+// common left edge and then separated vertically, which is two of them at once.
+// There is no mode enum any more -- each operation has a neutral default
+// (Align None, Spread 1, Step 0), so "off" needs no separate way to say it.
+//
+// They apply in a fixed order -- Align, then Spread, then Step -- because it is
+// the only order that reads as a sequence of intentions rather than a
+// coincidence: put them in a line, push them apart, then march them along.
+// Spread measures from the ALIGNED positions, not the original ones.
 
-/// The order elements are considered in. Drives the Stagger index, and the
+/// The order elements are considered in. Drives the Step index, and the
 /// painter's order in which the layered composite stacks them.
 enum ArrangeOrder {
   kOrderLeftRight = 0,
@@ -42,22 +46,30 @@ enum AlignHMode { kAlignHNone = 0, kAlignLeft = 1, kAlignCenterH = 2, kAlignRigh
 enum AlignVMode { kAlignVNone = 0, kAlignTop = 1, kAlignMiddle = 2, kAlignBottom = 3 };
 
 struct ArrangeParams {
-  int mode = kArrangeNone;
   int order = kOrderLeftRight;
   bool reverse = false;
-
-  /// 1.0 is no movement; 2.0 doubles every element's distance from the centre.
-  double spread = 1.0;
-
-  /// Per-index step, as a fraction of the frame. Y is in the user's y-up sense.
-  double stepX = 0.0, stepY = 0.0;
 
   int alignH = kAlignHNone;
   int alignV = kAlignVNone;
 
+  /// Per axis. 1.0 is no movement; 2.0 doubles each element's distance from the
+  /// shared centre.
+  ///
+  /// Being MULTIPLICATIVE has a consequence worth knowing: it cannot separate
+  /// elements that are already on top of each other, because twice nothing is
+  /// still nothing. Left-align a row and their vertical positions collapse
+  /// together, and no amount of vertical Spread will part them again -- Step is
+  /// the control for that. The trade buys a number that means the same thing
+  /// whatever the original spacing was, which a distance does not.
+  double spreadX = 1.0, spreadY = 1.0;
+
+  /// Per-index step, as a fraction of the frame. Y is in the user's y-up sense.
+  double stepX = 0.0, stepY = 0.0;
+
   bool operator==(const ArrangeParams& o) const {
-    return mode == o.mode && order == o.order && reverse == o.reverse && spread == o.spread &&
-           stepX == o.stepX && stepY == o.stepY && alignH == o.alignH && alignV == o.alignV;
+    return order == o.order && reverse == o.reverse && alignH == o.alignH &&
+           alignV == o.alignV && spreadX == o.spreadX && spreadY == o.spreadY &&
+           stepX == o.stepX && stepY == o.stepY;
   }
   bool operator!=(const ArrangeParams& o) const { return !(*this == o); }
 };
@@ -183,50 +195,69 @@ inline std::vector<Placement> ComputeArrangement(const Segmentation& seg, const 
   if (ap.reverse) std::reverse(out.begin(), out.end());
   for (std::size_t i = 0; i < out.size(); ++i) out[i].index = int(i);
 
-  switch (ap.mode) {
-    case kArrangeSpread:
-      // A factor rather than a distance, so one control works whatever the
-      // elements' spacing is, and 1.0 is exactly no movement.
-      for (Placement& p : out) {
-        p.dx = float((detail::centreX(p.bbox) - allCx) * (ap.spread - 1.0));
-        p.dy = float((detail::centreY(p.bbox) - allCy) * (ap.spread - 1.0));
-      }
-      break;
-
-    case kArrangeStagger:
-      // Y negated because the control is in the user's y-up sense and this is
-      // all top-down, the same flip the global transform makes.
-      for (Placement& p : out) {
-        p.dx = float(ap.stepX * double(w) * p.index);
-        p.dy = float(-ap.stepY * double(h) * p.index);
-      }
-      break;
-
-    case kArrangeAlign:
-      for (Placement& p : out) {
-        switch (ap.alignH) {
-          case kAlignLeft: p.dx = float(all.x1 - p.bbox.x1); break;
-          case kAlignCenterH: p.dx = allCx - detail::centreX(p.bbox); break;
-          case kAlignRight: p.dx = float(all.x2 - p.bbox.x2); break;
-          default: break;
-        }
-        // Top and Bottom are visual, and top-down y makes them y1 and y2
-        // directly -- no flip, because these are positions within the frame
-        // rather than an offset the user typed.
-        switch (ap.alignV) {
-          case kAlignTop: p.dy = float(all.y1 - p.bbox.y1); break;
-          case kAlignMiddle: p.dy = allCy - detail::centreY(p.bbox); break;
-          case kAlignBottom: p.dy = float(all.y2 - p.bbox.y2); break;
-          default: break;
-        }
-      }
-      break;
-
-    case kArrangeNone:
-    default:
-      break;
+  // Work in absolute positions and difference at the end, so the three
+  // operations genuinely chain: Spread has to measure from where Align put
+  // things, which summing three independent offsets would not do.
+  const std::size_t n = out.size();
+  std::vector<float> px(n), py(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    px[i] = detail::centreX(out[i].bbox);
+    py[i] = detail::centreY(out[i].bbox);
   }
 
+  // 1. Align, against the extent of the whole selection as it started.
+  //
+  // Top and Bottom are visual, and top-down y makes them y1 and y2 directly --
+  // no flip, because these are positions within the frame rather than an offset
+  // the user typed.
+  for (std::size_t i = 0; i < n; ++i) {
+    const RectI& b = out[i].bbox;
+    switch (ap.alignH) {
+      case kAlignLeft: px[i] += float(all.x1 - b.x1); break;
+      case kAlignCenterH: px[i] = allCx; break;
+      case kAlignRight: px[i] += float(all.x2 - b.x2); break;
+      default: break;
+    }
+    switch (ap.alignV) {
+      case kAlignTop: py[i] += float(all.y1 - b.y1); break;
+      case kAlignMiddle: py[i] = allCy; break;
+      case kAlignBottom: py[i] += float(all.y2 - b.y2); break;
+      default: break;
+    }
+  }
+
+  // 2. Spread, from the midpoint of the aligned positions.
+  //
+  // The midpoint of the extremes rather than the mean: the mean drifts toward
+  // whichever side happens to hold more elements, so adding one more item to a
+  // cluster would shift everything else. The midpoint only moves when the
+  // outermost elements move.
+  if (ap.spreadX != 1.0 || ap.spreadY != 1.0) {
+    float loX = px[0], hiX = px[0], loY = py[0], hiY = py[0];
+    for (std::size_t i = 1; i < n; ++i) {
+      loX = std::min(loX, px[i]);
+      hiX = std::max(hiX, px[i]);
+      loY = std::min(loY, py[i]);
+      hiY = std::max(hiY, py[i]);
+    }
+    const float cx = (loX + hiX) * 0.5f, cy = (loY + hiY) * 0.5f;
+    for (std::size_t i = 0; i < n; ++i) {
+      px[i] = cx + (px[i] - cx) * float(ap.spreadX);
+      py[i] = cy + (py[i] - cy) * float(ap.spreadY);
+    }
+  }
+
+  // 3. Step. Y negated because the control is in the user's y-up sense and this
+  // is all top-down, the same flip the global transform makes.
+  for (std::size_t i = 0; i < n; ++i) {
+    px[i] += float(ap.stepX * double(w) * out[i].index);
+    py[i] += float(-ap.stepY * double(h) * out[i].index);
+  }
+
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i].dx = px[i] - detail::centreX(out[i].bbox);
+    out[i].dy = py[i] - detail::centreY(out[i].bbox);
+  }
   return out;
 }
 

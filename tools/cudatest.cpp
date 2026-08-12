@@ -32,7 +32,7 @@ struct Case {
   float feather;
   bool invert;
   bool transform;
-  int arrangeMode = am::kArrangeNone;  ///< non-None exercises the layered path
+  bool arranged = false;  ///< true exercises the layered path
 };
 
 // A synthetic frame with soft edges, holes and elements running off the border.
@@ -97,13 +97,13 @@ int runCase(const Case& c, int w, int h, const std::vector<float>& src,
   const am::ImageView sv{src.data(), w, h, std::ptrdiff_t(w) * 4};
   std::vector<float> gpu(std::size_t(w) * h * 4, 0.0f);
 
-  if (c.arrangeMode != am::kArrangeNone) {
+  if (c.arranged) {
     // The layered path. The layer is built once on the host and fed to both
     // sides, so what is under test is the combine kernel rather than the
     // element scatter -- which never runs on the device.
     am::ArrangeParams ap;
-    ap.mode = c.arrangeMode;
-    ap.spread = 1.8;
+    ap.spreadX = 1.8;
+    ap.spreadY = 1.3;
     ap.stepX = 0.05;
     ap.stepY = -0.03;
     ap.alignV = am::kAlignMiddle;
@@ -199,19 +199,19 @@ int main() {
       // warping the source. Every output mode again, because each one consumes
       // the layer differently -- Cutout in particular has to unpremultiply it.
       {"layered matte", am::kOutMatte, am::kBgRemoved, 0, 6.0f, false, false,
-       am::kArrangeSpread},
+       true},
       {"layered cutout", am::kOutCutout, am::kBgRemoved, 0, 6.0f, false, false,
-       am::kArrangeSpread},
+       true},
       {"layered cutout premult", am::kOutCutoutPM, am::kBgRemoved, 3, 6.0f, false, false,
-       am::kArrangeStagger},
+       true},
       {"layered preview", am::kOutPreview, am::kBgRemoved, 0, 4.0f, false, false,
-       am::kArrangeStagger},
+       true},
       {"layered composite", am::kOutComposite, am::kBgRemoved, 0, 8.0f, false, false,
-       am::kArrangeSpread},
+       true},
       {"layered composite, left", am::kOutComposite, am::kBgLeft, 0, 5.0f, false, false,
-       am::kArrangeAlign},
+       true},
       {"layered + transform", am::kOutComposite, am::kBgRemoved, 2, 5.0f, false, true,
-       am::kArrangeSpread},
+       true},
   };
 
   int failures = 0;

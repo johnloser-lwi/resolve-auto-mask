@@ -104,18 +104,31 @@ a preview toggle you can forget is on is worse than no preview at all.
 **Composite** to see the selection move within the picture rather than on its
 own.
 
-**Arrange** — `Mode` (None / Spread / Stagger / Align), `Order`, `Reverse
-Order`, and the controls for the chosen mode.
+**Arrange** — `Order`, `Reverse Order`, `Align Horizontal`, `Align Vertical`,
+`Spread` (X/Y), `Step` (X/Y).
 
 This moves the selected elements relative to *each other*, before the Transform
-above moves them as a group.
+above moves them as a group. The three operations **compose**, and apply in a
+fixed order — Align, then Spread, then Step:
 
-- *Spread* pushes them apart from their shared centre. It is a multiplier, not
-  a distance, so 1.0 is exactly no movement and one value works whatever the
-  original spacing was.
-- *Stagger* steps each element along by a fixed amount in `Order`, for a
-  cascade. The first element does not move.
-- *Align* snaps them all to a common edge or centre.
+- *Align* snaps them to a common edge or centre, per axis.
+- *Spread* pushes them apart from their shared centre, per axis. 1.0 is no
+  movement, 2.0 doubles every gap, below 1.0 pulls them together.
+- *Step* moves each element one further increment than the one before it, in
+  `Order`. The first element does not move.
+
+There is no mode selector: each operation has a neutral default, so "off" needs
+no separate way to say it. That composability is the point — a left-aligned
+vertical column is Align Left plus a Y Step, and an exclusive mode cannot
+express it.
+
+**Spread is multiplicative, and that has a consequence.** It scales each
+element's distance from the centre, so it cannot separate elements that already
+sit on top of one another — twice nothing is still nothing. Left-align a row and
+their vertical positions collapse together; no amount of vertical Spread will
+part them again. `Step` is the control for that. The trade buys a number that
+means the same thing whatever the original spacing was, which a distance does
+not.
 
 `Order` decides which element counts as first — position, size, reading order,
 or distance from the centre — and also which element sits on top where two

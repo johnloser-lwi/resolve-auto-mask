@@ -138,14 +138,7 @@ Options parseArgs(int argc, char** argv) {
       o.centerCheck = true;
     } else if (eq(a, "--bench")) {
       o.bench = std::atoi(next());
-    } else if (eq(a, "--arrange")) {
-      const char* v = next();
-      if (eq(v, "none")) o.arrange.mode = am::kArrangeNone;
-      else if (eq(v, "spread")) o.arrange.mode = am::kArrangeSpread;
-      else if (eq(v, "stagger")) o.arrange.mode = am::kArrangeStagger;
-      else if (eq(v, "align")) o.arrange.mode = am::kArrangeAlign;
-      else die("--arrange must be none|spread|stagger|align");
-    } else if (eq(a, "--order")) {
+        } else if (eq(a, "--order")) {
       const char* v = next();
       if (eq(v, "lr")) o.arrange.order = am::kOrderLeftRight;
       else if (eq(v, "rl")) o.arrange.order = am::kOrderRightLeft;
@@ -159,7 +152,10 @@ Options parseArgs(int argc, char** argv) {
     } else if (eq(a, "--reverse")) {
       o.arrange.reverse = true;
     } else if (eq(a, "--spread")) {
-      o.arrange.spread = std::atof(next());
+      float sx = 0.0f, sy = 0.0f;
+      parsePair(next(), sx, sy);
+      o.arrange.spreadX = sx;
+      o.arrange.spreadY = sy;
     } else if (eq(a, "--step")) {
       float sx = 0.0f, sy = 0.0f;
       parsePair(next(), sx, sy);
