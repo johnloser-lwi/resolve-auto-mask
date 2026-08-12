@@ -110,18 +110,23 @@ int runCase(const Case& c, int w, int h, const std::vector<float>& src,
 
     const std::vector<am::Placement> pl =
         am::ComputeArrangement(seg, sel, ap, float(w), float(h));
+    const am::RectI region = am::VisibleSourceRegion(cp.inv, cp.identity, w, h);
     am::ElementLayer layer;
-    am::BuildElementLayer(sv, seg, pl, mp, am::kFilterBilinear, layer);
+    am::BuildElementLayer(sv, seg, pl, mp, am::kFilterBilinear, region, layer);
 
-    const am::ImageView lc{layer.colour.data(), w, h, std::ptrdiff_t(w) * 4};
-    const am::PlaneView la{layer.coverage.data(), w, h};
+    const am::ImageView lc{layer.colour.data(), layer.width(), layer.height(),
+                           std::ptrdiff_t(layer.width()) * 4};
+    const am::PlaneView la{layer.coverage.data(), layer.width(), layer.height()};
     for (int y = 0; y < h; ++y)
       for (int x = 0; x < w; ++x)
-        am::RenderPixelLayered(sv, pv, lc, la, cp, x, y, &cpu[(std::size_t(y) * w + x) * 4]);
+        am::RenderPixelLayered(sv, pv, lc, la, layer.bounds.x1, layer.bounds.y1, cp, x, y,
+                               &cpu[(std::size_t(y) * w + x) * 4]);
 
     if (!am::CudaRenderLayeredHostSync(src.data(), gpu.data(), labels.data(), selected.data(),
                                        labelCount, w, h, c.expand, c.feather, c.invert,
-                                       layer.colour.data(), layer.coverage.data(), cp)) {
+                                       layer.colour.data(), layer.coverage.data(),
+                                       layer.bounds.x1, layer.bounds.y1, layer.width(),
+                                       layer.height(), cp)) {
       std::fprintf(stderr, "  %-28s CUDA call FAILED\n", c.name);
       return 1;
     }

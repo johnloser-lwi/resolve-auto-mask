@@ -89,8 +89,8 @@ bool CudaRender(CudaContext* ctx, const float* devSrc, float* devDst, int width,
 /// space, so it survives every change to Position, Scale and Rotation, and the
 /// upload happens when the SELECTION or the arrangement changes rather than per
 /// frame.
-bool CudaUploadLayer(CudaContext* ctx, const float* colour, const float* coverage, int width,
-                     int height, void* stream);
+bool CudaUploadLayer(CudaContext* ctx, const float* colour, const float* coverage, int originX,
+                     int originY, int width, int height, void* stream);
 
 /// Drop any resident layer, so the next render uses the single-pass path.
 void CudaClearLayer(CudaContext* ctx);
@@ -122,7 +122,8 @@ bool CudaRenderHostSync(const float* hostSrc, float* hostDst, const std::int32_t
 bool CudaRenderLayeredHostSync(const float* hostSrc, float* hostDst, const std::int32_t* labels,
                                const std::uint8_t* selected, int labelCount, int width,
                                int height, int expand, float feather, bool invert,
-                               const float* layerColour, const float* layerCoverage,
+                               const float* layerColour, const float* layerCoverage, int layerX0,
+                               int layerY0, int layerW, int layerH,
                                const CompositeParams& params);
 
 }  // namespace am

@@ -50,6 +50,7 @@ struct Options {
   am::ArrangeParams arrange;
   bool printOrder = false;
   std::string expectOrder;
+  int expectAlphaMin = -1;
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -179,6 +180,8 @@ Options parseArgs(int argc, char** argv) {
       o.printOrder = true;
     } else if (eq(a, "--expect-order")) {
       o.expectOrder = next();
+    } else if (eq(a, "--expect-alpha-min")) {
+      o.expectAlphaMin = std::atoi(next());
     } else {
       die(std::string("unknown option ") + a);
     }
@@ -359,15 +362,19 @@ int main(int argc, char** argv) {
   if (am::ArrangementMoves(placements)) {
     // Layered: each element shifted and stacked, then the global transform
     // applied to the finished layer by the combine. See ElementLayer.h.
+    // Sized to what the global transform can still reach, NOT to the frame:
+    // Arrange may put elements outside it and the transform runs afterwards.
+    const am::RectI region =
+        am::VisibleSourceRegion(cp.inv, cp.identity, seg.width, seg.height);
     am::ElementLayer layer;
-    am::BuildElementLayer(src, seg, placements, o.mask, o.filter, layer);
+    am::BuildElementLayer(src, seg, placements, o.mask, o.filter, region, layer);
 
-    const am::ImageView lc{layer.colour.data(), seg.width, seg.height,
-                           std::ptrdiff_t(seg.width) * 4};
-    const am::PlaneView la{layer.coverage.data(), seg.width, seg.height};
+    const am::ImageView lc{layer.colour.data(), layer.width(), layer.height(),
+                           std::ptrdiff_t(layer.width()) * 4};
+    const am::PlaneView la{layer.coverage.data(), layer.width(), layer.height()};
     for (int y = 0; y < seg.height; ++y)
       for (int x = 0; x < seg.width; ++x)
-        am::RenderPixelLayered(src, plane, lc, la, cp, x, y,
+        am::RenderPixelLayered(src, plane, lc, la, layer.bounds.x1, layer.bounds.y1, cp, x, y,
                                &out[(std::size_t(y) * seg.width + x) * 4]);
   } else {
     for (int y = 0; y < seg.height; ++y)
@@ -475,6 +482,26 @@ int main(int argc, char** argv) {
     std::printf("  ----\n  cached path  %8.2f ms\n  cold path    %8.2f ms\n",
                 (ms(tHash) + ms(tResolve) + ms(tMask) + ms(tRender)) / n,
                 (ms(tHash) + ms(tSeg) + ms(tResolve) + ms(tMask) + ms(tRender)) / n);
+  }
+
+  // How much opaque content actually survived to the output.
+  //
+  // The regression test for clipping order: Arrange can push an element outside
+  // the frame, and the global transform runs AFTERWARDS. If the element layer
+  // were sized to the frame, that element would already have been discarded and
+  // scaling back down could not recover it -- the count drops and this catches
+  // it. A picture comparison would not: the result looks perfectly plausible,
+  // just missing something.
+  if (o.expectAlphaMin >= 0) {
+    int solid = 0;
+    for (std::size_t i = 3; i < out.size(); i += 4)
+      if (out[i] > 0.5f) ++solid;
+    std::printf("opaque pixels: %d (need >= %d)\n", solid, o.expectAlphaMin);
+    if (solid < o.expectAlphaMin) {
+      std::fprintf(stderr, "masktest: only %d opaque pixels, expected at least %d\n", solid,
+                   o.expectAlphaMin);
+      return 1;
+    }
   }
 
   if (!o.outPath.empty()) writePng(o.outPath, seg.width, seg.height, out);

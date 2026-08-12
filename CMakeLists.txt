@@ -199,6 +199,20 @@ add_test(NAME arrange_align_and_step
                  --select-all --output preview --align-h left --step 0,-0.15
                  --order tb --expect-order "1,2,3")
 
+# Clipping order. Arrange runs BEFORE the global transform, so an element it
+# pushes outside the frame must survive to be scaled back in afterwards.
+#
+# A Step of 0.4 puts two of the three shapes well off the bottom; a global scale
+# of 0.4 brings all three back. Unarranged the frame holds 14600 opaque pixels,
+# so at 0.4 scale (0.16 area) roughly 2340 should survive. When the element
+# layer was sized to the frame, the off-frame shapes were destroyed before the
+# transform ever ran and the count collapsed. The picture looked entirely
+# plausible either way, which is why this is a count and not an eyeball.
+add_test(NAME arrange_survives_transform
+         COMMAND masktest "${TESTDATA}/three_shapes.png" "${SCRATCH}/offframe.png"
+                 --select-all --output cutoutpm --order lr --step 0,-0.4 --scale 0.4
+                 --expect-alpha-min 2200)
+
 # CPU/GPU parity. Skips itself, rather than failing, on a machine with no GPU.
 if(AUTOMASK_HAVE_CUDA)
     add_executable(cudatest tools/cudatest.cpp src/core/Segmentation.cpp)

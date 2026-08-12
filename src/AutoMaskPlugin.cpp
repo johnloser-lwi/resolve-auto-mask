@@ -114,9 +114,10 @@ public:
     {
         if (_layer)
         {
-            _layerColour = ImageView{_layer->colour.data(), _layer->width, _layer->height,
-                                     std::ptrdiff_t(_layer->width) * 4};
-            _layerCoverage = PlaneView{_layer->coverage.data(), _layer->width, _layer->height};
+            _layerColour = ImageView{_layer->colour.data(), _layer->width(), _layer->height(),
+                                     std::ptrdiff_t(_layer->width()) * 4};
+            _layerCoverage =
+                PlaneView{_layer->coverage.data(), _layer->width(), _layer->height()};
         }
     }
 
@@ -134,7 +135,8 @@ public:
             {
                 float* row = _dst.row(y);
                 for (int x = _window.x1; x < _window.x2; ++x)
-                    RenderPixelLayered(_src, _mask, _layerColour, _layerCoverage, _cp, x, y,
+                    RenderPixelLayered(_src, _mask, _layerColour, _layerCoverage,
+                                       _layer->bounds.x1, _layer->bounds.y1, _cp, x, y,
                                        row + std::ptrdiff_t(x) * 4);
             }
             return;
@@ -266,11 +268,16 @@ AutoMaskPlugin::FrameParams AutoMaskPlugin::ReadFrameParams(double time) const
 
 std::shared_ptr<const am::ElementLayer> AutoMaskPlugin::LayerFor(
     const ImageView& src, const std::shared_ptr<const Segmentation>& seg,
-    const std::string& points, const FrameParams& fp) const
+    const std::string& points, const FrameParams& fp, const RectI& region) const
 {
     std::lock_guard<std::mutex> lock(_layerCache.mutex);
-    if (_layerCache.valid && _layerCache.seg == seg && _layerCache.points == points &&
-        _layerCache.maskParams == fp.mask && _layerCache.arrangeParams == fp.arrange)
+    const bool sameInputs = _layerCache.valid && _layerCache.seg == seg &&
+                            _layerCache.points == points &&
+                            _layerCache.maskParams == fp.mask &&
+                            _layerCache.arrangeParams == fp.arrange;
+    // A cached null means "this arrangement moves nothing", which no change of
+    // region can alter.
+    if (sameInputs && (!_layerCache.layer || _layerCache.covers(region)))
         return _layerCache.layer;
 
     std::shared_ptr<const ElementLayer> built;
@@ -289,8 +296,12 @@ std::shared_ptr<const am::ElementLayer> AutoMaskPlugin::LayerFor(
         // longer exactly the combined mask.
         if (ArrangementMoves(placements))
         {
+            // Built with margin, so nudging the transform stays inside the
+            // cached extent instead of triggering a rebuild on every frame.
+            RectI grown = region;
+            grown.grow(std::max(64, std::max(seg->width, seg->height) / 8));
             auto layer = std::make_shared<ElementLayer>();
-            BuildElementLayer(src, *seg, placements, fp.mask, fp.filter, *layer);
+            BuildElementLayer(src, *seg, placements, fp.mask, fp.filter, grown, *layer);
             built = layer;
         }
     }
@@ -446,7 +457,14 @@ void AutoMaskPlugin::render(const OFX::RenderArguments& p_Args)
     if (window.empty()) return;
 
     const PlaneView plane{mask->data(), seg->width, seg->height};
-    const std::shared_ptr<const ElementLayer> layer = LayerFor(srcView, seg, points, fp);
+    // How much of arranged space the transform can still reach. Sizing the
+    // layer to this is what keeps Arrange from clipping elements to the frame
+    // BEFORE the transform runs -- otherwise scaling down could never bring an
+    // off-frame element back, because it would already have been discarded.
+    const RectI visible =
+        VisibleSourceRegion(cp.inv, cp.identity, srcView.width, srcView.height);
+    const std::shared_ptr<const ElementLayer> layer =
+        LayerFor(srcView, seg, points, fp, visible);
 
     BandRenderer renderer(srcView, dstView, plane, cp, window, layer.get());
     renderer.multiThread();
@@ -581,7 +599,10 @@ bool AutoMaskPlugin::renderCuda(const OFX::RenderArguments& p_Args, OFX::Image* 
         {
             const ImageView topDown{_downloadBuf.data() + std::size_t(h - 1) * w * 4, w, h,
                                     -std::ptrdiff_t(w) * 4};
-            layer = LayerFor(topDown, seg, points, fp);
+            layer = LayerFor(topDown, seg, points, fp,
+                             VisibleSourceRegion(fp.composite(float(w), float(h)).inv,
+                                                 fp.composite(float(w), float(h)).identity, w,
+                                                 h));
         }
     }
 
@@ -591,8 +612,9 @@ bool AutoMaskPlugin::renderCuda(const OFX::RenderArguments& p_Args, OFX::Image* 
         // arranged space, so Position, Scale and Rotation do not touch it.
         if (_cudaLayer != layer)
         {
-            if (!CudaUploadLayer(_cuda, layer->colour.data(), layer->coverage.data(), w, h,
-                                 stream))
+            if (!CudaUploadLayer(_cuda, layer->colour.data(), layer->coverage.data(),
+                                 layer->bounds.x1, layer->bounds.y1, layer->width(),
+                                 layer->height(), stream))
                 return false;
             _cudaLayer = layer;
         }

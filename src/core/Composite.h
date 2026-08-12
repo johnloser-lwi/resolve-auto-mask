@@ -82,6 +82,65 @@ inline mtx::Mat3 ElementLinearPart(double scaleX, double scaleY, double rotDeg) 
          mtx::Mat3::Scale(float(scaleX), float(scaleY));
 }
 
+/// The region of pre-transform space that the global transform can actually
+/// bring into the frame.
+///
+/// This is what stops the arranged layer being clipped to the frame before the
+/// transform has had its say. Arrange can push an element past the edge, and if
+/// the layer were only frame-sized that element would be destroyed at that
+/// point -- scaling down afterwards would not bring it back, because there
+/// would be nothing left to bring. Inverse-mapping the frame corners says
+/// exactly how much surrounding space is reachable, so nothing visible is ever
+/// thrown away and nothing invisible is ever paid for.
+///
+/// @param maxExpand caps each dimension at this multiple of the frame. A scale
+///        of 0.01 makes the reachable region a hundred frames wide, which is
+///        not worth allocating for; the far edges of that are of no interest.
+inline RectI VisibleSourceRegion(const mtx::Mat3& inv, bool identity, int w, int h,
+                                 int maxExpand = 3) {
+  if (identity) return RectI{0, 0, w, h};
+
+  const float cx[4] = {0.0f, float(w), 0.0f, float(w)};
+  const float cy[4] = {0.0f, 0.0f, float(h), float(h)};
+  float lo0 = 0, lo1 = 0, hi0 = 0, hi1 = 0;
+  for (int k = 0; k < 4; ++k) {
+    float px = 0.0f, py = 0.0f;
+    inv.Apply(cx[k], cy[k], px, py);
+    if (k == 0) {
+      lo0 = hi0 = px;
+      lo1 = hi1 = py;
+    } else {
+      lo0 = lo0 < px ? lo0 : px;
+      hi0 = hi0 > px ? hi0 : px;
+      lo1 = lo1 < py ? lo1 : py;
+      hi1 = hi1 > py ? hi1 : py;
+    }
+  }
+
+  RectI r{int(std::floor(lo0)) - 1, int(std::floor(lo1)) - 1, int(std::ceil(hi0)) + 1,
+          int(std::ceil(hi1)) + 1};
+
+  // Always at least the frame: a transform that pushes everything off screen
+  // still has to leave somewhere to composite the background.
+  if (r.x1 > 0) r.x1 = 0;
+  if (r.y1 > 0) r.y1 = 0;
+  if (r.x2 < w) r.x2 = w;
+  if (r.y2 < h) r.y2 = h;
+
+  const int maxW = w * maxExpand, maxH = h * maxExpand;
+  if (r.width() > maxW) {
+    const int mid = (r.x1 + r.x2) / 2;
+    r.x1 = mid - maxW / 2;
+    r.x2 = r.x1 + maxW;
+  }
+  if (r.height() > maxH) {
+    const int mid = (r.y1 + r.y2) / 2;
+    r.y1 = mid - maxH / 2;
+    r.y2 = r.y1 + maxH;
+  }
+  return r;
+}
+
 /// Fetch the element layer (source premultiplied by the mask) and the mask
 /// coverage at one continuous coordinate, in a single pass over the four
 /// corners.
@@ -272,27 +331,45 @@ MTX_HD inline void RenderPixel(const ImageView& src, const PlaneView& mask,
 /// Mirrors RenderPixel's mode handling exactly. It is a separate function
 /// rather than a flag inside RenderPixel because the per-pixel hot path of the
 /// common case should not carry a branch for the rare one.
+/// @param layerX0,layerY0 where the layer's (0,0) sits in arranged space. The
+///        layer is generally larger than the frame and starts at a negative
+///        offset -- see VisibleSourceRegion -- so every lookup has to be
+///        rebased. Forgetting this shifts the whole arrangement by however far
+///        the layer extends past the top-left corner.
 MTX_HD inline void RenderPixelLayered(const ImageView& src, const PlaneView& mask,
                                       const ImageView& layerColour,
-                                      const PlaneView& layerCoverage, const CompositeParams& p,
-                                      int x, int y, float* out) {
+                                      const PlaneView& layerCoverage, int layerX0, int layerY0,
+                                      const CompositeParams& p, int x, int y, float* out) {
   float Ew[4];
   float Aw;
 
-  if (p.identity) {
-    const float* e = layerColour.at(x, y);
-    for (int c = 0; c < 4; ++c) Ew[c] = e[c];
-    Aw = layerCoverage.at(x, y);
-  } else {
+  {
+    float sx = float(x) + 0.5f, sy = float(y) + 0.5f;
     // The global transform, applied to the finished arrangement. Colour and
     // coverage are sampled from buffers that were built together, and the
     // colour is already premultiplied by the coverage, so interpolating them
     // separately here is consistent -- the halo problem SampleElement guards
     // against was already dealt with when the layer was built.
-    float sx, sy;
-    p.inv.Apply(float(x) + 0.5f, float(y) + 0.5f, sx, sy);
-    SampleImage(layerColour, sx, sy, p.filter, kEdgeBlack, Ew);
-    Aw = SamplePlane(layerCoverage, sx, sy, p.filter, kEdgeBlack);
+    if (!p.identity) p.inv.Apply(float(x) + 0.5f, float(y) + 0.5f, sx, sy);
+    sx -= float(layerX0);
+    sy -= float(layerY0);
+
+    if (p.identity) {
+      // Whole pixels, so take them verbatim rather than round-tripping through
+      // the resampler.
+      const int lx = x - layerX0, ly = y - layerY0;
+      if (lx >= 0 && ly >= 0 && lx < layerColour.width && ly < layerColour.height) {
+        const float* e = layerColour.at(lx, ly);
+        for (int c = 0; c < 4; ++c) Ew[c] = e[c];
+        Aw = layerCoverage.at(lx, ly);
+      } else {
+        Ew[0] = Ew[1] = Ew[2] = Ew[3] = 0.0f;
+        Aw = 0.0f;
+      }
+    } else {
+      SampleImage(layerColour, sx, sy, p.filter, kEdgeBlack, Ew);
+      Aw = SamplePlane(layerCoverage, sx, sy, p.filter, kEdgeBlack);
+    }
   }
 
   if (p.outputMode == kOutMatte) {

@@ -81,6 +81,16 @@ struct LayerCache {
     ArrangeParams arrangeParams;
     std::shared_ptr<const ElementLayer> layer;   ///< null when nothing is arranged
     bool valid = false;
+
+    /// Reused while the cached layer still COVERS what is now needed, rather
+    /// than only when the requirement matches exactly. The needed region grows
+    /// and shrinks with the global transform, so an equality test would rebuild
+    /// the layer on every frame of a Position drag -- which is the cost the
+    /// arranged-space design exists to avoid.
+    bool covers(const RectI& want) const {
+        return valid && layer && layer->bounds.x1 <= want.x1 && layer->bounds.y1 <= want.y1 &&
+               layer->bounds.x2 >= want.x2 && layer->bounds.y2 >= want.y2;
+    }
 };
 
 } // namespace am
@@ -195,7 +205,7 @@ private:
     /// means.
     std::shared_ptr<const am::ElementLayer> LayerFor(
         const am::ImageView& src, const std::shared_ptr<const am::Segmentation>& seg,
-        const std::string& points, const FrameParams& fp) const;
+        const std::string& points, const FrameParams& fp, const am::RectI& region) const;
 
 #ifdef AUTOMASK_HAVE_CUDA
     /// Device-resident label image, selection lookup and built mask.

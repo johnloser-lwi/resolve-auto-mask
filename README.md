@@ -282,6 +282,16 @@ it. This is not about speed: per-element feathering makes the coverages overlap
 slightly, so their sum is no longer exactly the combined mask, and only the
 single-pass path is exact at identity.
 
+*The layer is NOT clipped to the frame.* Arrange can push an element past the
+edge, and the global transform runs afterwards — so a frame-sized layer would
+destroy that element before the transform ever got the chance to bring it back,
+and scaling down would recover nothing. `VisibleSourceRegion` inverse-maps the
+frame corners through the transform to size the layer to exactly what is
+reachable: nothing visible is thrown away, nothing invisible is paid for, and a
+transform far enough out is capped at 3× the frame. `arrange_survives_transform`
+counts surviving opaque pixels rather than comparing pictures, because the
+clipped result looked entirely plausible — just missing a shape.
+
 *The layer is built in arranged space, without the global transform.*
 Composition is associative, so warping the finished layer gives the same pixels
 as warping each element — but it makes the layer independent of Position, Scale

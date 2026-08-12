@@ -34,16 +34,26 @@
 
 namespace am {
 
+/// The arranged elements, rasterised into their own buffer.
+///
+/// `bounds` is in arranged-space pixels and is deliberately NOT the frame. An
+/// arrangement can put elements outside it, and the global transform runs
+/// afterwards -- so clipping to the frame here would destroy content the
+/// transform could still bring back into view. `bounds` covers everything the
+/// transform can reach; see VisibleSourceRegion.
 struct ElementLayer {
-  int width = 0, height = 0;
-  std::vector<float> colour;    ///< w*h*4, premultiplied, in destination space
-  std::vector<float> coverage;  ///< w*h
+  RectI bounds;
+  std::vector<float> colour;    ///< premultiplied, bounds-sized
+  std::vector<float> coverage;
 
-  void reset(int w, int h) {
-    width = w;
-    height = h;
-    colour.assign(std::size_t(w) * h * 4, 0.0f);
-    coverage.assign(std::size_t(w) * h, 0.0f);
+  int width() const { return bounds.width(); }
+  int height() const { return bounds.height(); }
+
+  void reset(const RectI& b) {
+    bounds = b;
+    const std::size_t n = std::size_t(b.width()) * std::size_t(b.height());
+    colour.assign(n * 4, 0.0f);
+    coverage.assign(n, 0.0f);
   }
 };
 
@@ -72,12 +82,16 @@ inline int tileHalo(const MaskParams& mp) {
 ///
 /// @param placements one entry per element, in painter's order: later entries
 ///                   are composited on top.
+/// @param region the arranged-space rectangle to rasterise into. Anything
+///        outside it is genuinely unreachable and is dropped.
 inline void BuildElementLayer(const ImageView& src, const Segmentation& seg,
                               const std::vector<Placement>& placements, const MaskParams& mp,
-                              FilterMode filter, ElementLayer& out) {
+                              FilterMode filter, const RectI& region, ElementLayer& out) {
   const int w = seg.width, h = seg.height;
-  out.reset(w, h);
-  if (placements.empty() || w <= 0 || h <= 0) return;
+  out.reset(region);
+  if (placements.empty() || w <= 0 || h <= 0 || region.empty()) return;
+
+  const int lw = region.width();
 
   const int halo = detail::tileHalo(mp);
 
@@ -163,11 +177,14 @@ inline void BuildElementLayer(const ImageView& src, const Segmentation& seg,
           hi1 = std::max(hi1, py);
         }
       }
-      // One pixel of slack each way for the bilinear footprint.
-      dest.x1 = std::max(int(std::floor(lo0)) - 1, 0);
-      dest.y1 = std::max(int(std::floor(lo1)) - 1, 0);
-      dest.x2 = std::min(int(std::ceil(hi0)) + 1, w);
-      dest.y2 = std::min(int(std::ceil(hi1)) + 1, h);
+      // One pixel of slack each way for the bilinear footprint. Clipped to the
+      // LAYER, not to the frame: an element pushed off the edge by Arrange is
+      // still reachable by the global transform, and clipping it here would
+      // make that transform unable to bring it back.
+      dest.x1 = std::max(int(std::floor(lo0)) - 1, region.x1);
+      dest.y1 = std::max(int(std::floor(lo1)) - 1, region.y1);
+      dest.x2 = std::min(int(std::ceil(hi0)) + 1, region.x2);
+      dest.y2 = std::min(int(std::ceil(hi1)) + 1, region.y2);
     }
     if (dest.empty()) continue;
 
@@ -197,7 +214,8 @@ inline void BuildElementLayer(const ImageView& src, const Segmentation& seg,
               const float a = SamplePlane(maskView, tx, ty, filter, kEdgeBlack);
               if (a <= 0.0f && c[3] <= 0.0f) continue;
 
-              const std::size_t p = std::size_t(y) * w + x;
+              const std::size_t p =
+                  std::size_t(y - region.y1) * lw + std::size_t(x - region.x1);
               float* dc = &out.colour[p * 4];
               float& da = out.coverage[p];
 
