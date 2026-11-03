@@ -8,34 +8,79 @@ cmake_minimum_required(VERSION 3.24)
 # enable_language(CUDA).
 project(AutoMask VERSION 0.1.0 LANGUAGES CXX)
 
+include(CMakeDependentOption)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT WIN32)
-    message(FATAL_ERROR "This project currently targets Windows only.")
+if(NOT WIN32 AND NOT APPLE)
+    message(FATAL_ERROR "This project targets Windows and macOS.")
 endif()
 
-# Static CRT. An OFX bundle is loaded by a host that will not have our
-# redistributables installed, and a missing VCRUNTIME dll fails as a *silent
-# no-load*: Resolve simply never lists the plugin, with no error anywhere.
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# An OFX bundle names its payload directory after the architecture, and the
+# host looks in exactly one place. Get this wrong and the plugin is simply
+# never found, with no error from anywhere.
+if(WIN32)
+    set(OFX_ARCH_DIR "Win64")
+else()
+    # macOS uses a single MacOS directory for every slice, universal or not --
+    # NOT MacOS-x86-64, which is a Linux-style name that Resolve ignores.
+    set(OFX_ARCH_DIR "MacOS")
+endif()
+
+if(MSVC)
+    # Static CRT. An OFX bundle is loaded by a host that will not have our
+    # redistributables installed, and a missing VCRUNTIME dll fails as a
+    # *silent no-load*: Resolve simply never lists the plugin, with no error
+    # anywhere.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+if(APPLE)
+    # Universal by default. Resolve runs native arm64 on Apple Silicon and
+    # x86_64 on Intel, and a single-slice bundle is another way to be silently
+    # not listed -- the host loads what matches its own process and says
+    # nothing when nothing does.
+    option(AUTOMASK_UNIVERSAL "Build a universal arm64 + x86_64 binary" ON)
+    if(AUTOMASK_UNIVERSAL AND NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
+    endif()
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        # Below what any Resolve version needing this plugin runs on, so the
+        # deployment target is never the thing that rejects a machine.
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
+    endif()
+
+    # Visibility is deliberately left at the default. The OFX support library
+    # marks its entry points with __attribute__((visibility("default"))), so
+    # hiding everything else would work -- but a plugin whose OfxGetPlugin is
+    # not exported fails as a silent no-load, and that is not a failure worth
+    # risking to shrink a symbol table.
+endif()
+
+# Single-config generators leave CMAKE_BUILD_TYPE empty, which collapses the
+# per-config bundle path below and produces an unoptimised plugin that is slow
+# for no visible reason.
+get_property(_isMultiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _isMultiConfig AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
 
 # --- CUDA --------------------------------------------------------------------
-# OFF for v1, on purpose. Connected-component labeling is inherently serial
-# (union-find) and is already cached per content-hash, so it runs once per
-# CONTENT CHANGE, not once per frame -- it is not the per-frame cost. The
-# per-frame work is a handful of O(n) passes (mask build, two dilations, three
-# box-blur passes, one warp) that finish in single-digit milliseconds on one
-# core. Meanwhile the real cost in a GPU-resident host is the frame download,
-# and that is paid regardless because the labeling lives on the CPU: porting
-# only the blur and the warp would remove exactly zero transfers.
+# ON wherever a toolkit exists, because the CPU cannot reach real time and the
+# reason is bandwidth rather than arithmetic: at UHD, reading and writing one
+# RGBA float frame -- no feather, no transform, nothing -- measures 14.8 ms on
+# 24 threads against a 60 fps budget of 16.7 ms. The same traffic on the GPU is
+# about 0.07 ms. Resolve's pipeline is GPU-resident too, so declining CUDA also
+# forces a download and upload of every frame.
 #
-# Declaring no CUDA support makes Resolve perform the transfer itself,
-# correctly, with no download code to write or get wrong.
+# Labelling stays on the CPU regardless: it is serial, and cached per content
+# change. CudaHashSource is what stops that costing a transfer per frame.
 #
-# The block below is kept live rather than deleted so turning it on later is a
-# flag, not an archaeology exercise.
-option(AUTOMASK_CUDA "Build the CUDA render path" ON)
+# No CUDA on Apple, at any version -- the toolkit was dropped after 10.13 and
+# Apple Silicon never had it. macOS therefore runs the CPU path, and the GPU
+# story there is Metal, which is NOT written (see the README).
+cmake_dependent_option(AUTOMASK_CUDA "Build the CUDA render path" ON "NOT APPLE" OFF)
 set(AUTOMASK_HAVE_CUDA OFF)
 if(AUTOMASK_CUDA)
     # Real SASS for Turing/Ampere/Ada/Blackwell plus virtual PTX so
@@ -232,9 +277,9 @@ add_test(NAME auto_center_transformed
 # cannot tell which config they are actually shipping.
 set(BUNDLE_DIR "${CMAKE_BINARY_DIR}/$<CONFIG>/AutoMask.ofx.bundle")
 add_custom_command(TARGET AutoMask POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_DIR}/Contents/Win64"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_DIR}/Contents/${OFX_ARCH_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:AutoMask>" "${BUNDLE_DIR}/Contents/Win64/"
+            "$<TARGET_FILE:AutoMask>" "${BUNDLE_DIR}/Contents/${OFX_ARCH_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/packaging/Info.plist" "${BUNDLE_DIR}/Contents/"
     COMMENT "Assembling AutoMask.ofx.bundle"

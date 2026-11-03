@@ -1,0 +1,21 @@
+# Shell scripts must check out with LF on every platform. A CRLF shebang makes
+# macOS reject the file with "bad interpreter: /usr/bin/env bash^M", which
+# reads as the script being broken rather than merely line-ended wrongly.
+*.sh text eol=lf
+
+# PowerShell and the double-clickable launcher are Windows-side; CRLF is what
+# they are expected to have.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Source and build files: normalise in the repository, check out native.
+*.c    text
+*.cpp  text
+*.h    text
+*.cu   text
+*.txt  text
+*.md   text
+*.plist text eol=lf
+
+# Keep test fixtures byte-exact; a normalised PNG is a corrupted PNG.
+*.png binary

@@ -1,8 +1,18 @@
 ﻿#include "HostProbe.h"
 
-#include <windows.h>
-#include <shlobj.h>
+#if defined(_WIN32)
+    #include <shlobj.h>
+    #include <windows.h>
+#else
+    #include <sys/stat.h>
+    #include <sys/types.h>
 
+    #include <cstdlib>
+#endif
+
+#include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -20,8 +30,12 @@ std::mutex g_mutex;
 std::set<std::string> g_seen;
 bool g_hostDumped = false;
 
+// Where each platform expects an application's own log to live. Falling back
+// to the working directory is deliberate: a host that starts the plugin from
+// somewhere unwritable should lose the diagnostic, not the plugin.
 std::string LogDir()
 {
+#if defined(_WIN32)
     char path[MAX_PATH] = {0};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, path)))
     {
@@ -30,6 +44,41 @@ std::string LogDir()
         return dir;
     }
     return ".";
+#else
+    // ~/Library/Logs is the documented home for this on macOS and is what
+    // Console.app shows, so the probe turns up where someone would look.
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return ".";
+
+    std::string dir = std::string(home) + "/Library/Logs";
+    ::mkdir(dir.c_str(), 0755);   // already present on macOS; harmless if not
+    dir += "/AutoMask";
+    ::mkdir(dir.c_str(), 0755);
+    return dir;
+#endif
+}
+
+// One implementation rather than two. GetLocalTime and sprintf_s were doing
+// nothing chrono and snprintf do not, and a second copy of "format the time"
+// is a second place for the platforms to disagree about it.
+std::string Stamp()
+{
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const std::time_t t = system_clock::to_time_t(now);
+    const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+
+    char stamp[32];
+    std::snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d ", local.tm_hour, local.tm_min,
+                  local.tm_sec, int(ms.count()));
+    return stamp;
 }
 
 const char* YesNo(bool b) { return b ? "yes" : "NO"; }
@@ -38,7 +87,11 @@ const char* YesNo(bool b) { return b ? "yes" : "NO"; }
 
 std::string ProbeLogPath()
 {
+#if defined(_WIN32)
     static const std::string p = LogDir() + "\\probe.log";
+#else
+    static const std::string p = LogDir() + "/probe.log";
+#endif
     return p;
 }
 
@@ -48,11 +101,7 @@ void ProbeLog(const std::string& line)
     std::ofstream f(ProbeLogPath(), std::ios::app);
     if (!f) return;
 
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char stamp[32];
-    sprintf_s(stamp, "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    f << stamp << line << "\n";
+    f << Stamp() << line << "\n";
 }
 
 void ProbeOnce(const std::string& key, const std::string& line)

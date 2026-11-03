@@ -149,6 +149,8 @@ Two buttons worth knowing about:
 
 ## Building
 
+### Windows
+
 ```bash
 powershell -File scripts\build.ps1 -Config Release
 ```
@@ -170,6 +172,54 @@ powershell -File scripts\install.ps1 -Config Release
 
 Or double-click `scripts\Install-AutoMask.cmd`, which builds first.
 
+### macOS
+
+Needs the Xcode command line tools (`xcode-select --install`) and CMake
+(`brew install cmake`). Ninja is used if present, Make otherwise.
+
+```bash
+./scripts/build.sh
+```
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+```bash
+./scripts/install.sh
+```
+
+The build is **universal (arm64 + x86_64) by default**. Resolve runs native
+arm64 on Apple Silicon and x86_64 on Intel, and a bundle missing the slice for
+the host process is not an error anywhere — the plugin is simply never listed.
+Pass `--native` to build only for the machine you are on, which is faster and
+is all you need for your own testing.
+
+`install.sh` writes to `/Library/OFX/Plugins` and will ask for an administrator
+password. `--user` installs to `~/Library/OFX/Plugins` instead, with no
+password; `/Library` stays the default because it is the location every OFX
+host agrees on. It also re-applies an ad-hoc signature after copying: on Apple
+Silicon an invalid signature means the dylib will not load at all, which
+Resolve reports as the plugin not existing.
+
+The probe log is at `~/Library/Logs/AutoMask/probe.log`.
+
+**macOS has no GPU path.** CUDA does not exist on Apple Silicon and was dropped
+from macOS entirely after 10.13, so the Mac build runs the CPU path. That is a
+real limitation and the numbers above say how real: a UHD frame is memory-bound
+at around 15 ms before any work is done, so expect roughly 10–20 fps at UHD
+depending on the machine. HD is comfortable. Apple Silicon's unified memory
+softens the host transfer that declining GPU support otherwise forces, but it
+does not remove the per-frame CPU cost.
+
+The GPU answer on macOS is Metal, and it is **not written**. It is also not a
+mechanical port of the CUDA path: `Composite.h` is shared verbatim with the
+CUDA kernel because both are C++17, and Metal Shading Language is not — it has
+no `std::`, no `<cmath>`, and different rules for the headers this code relies
+on. A Metal path therefore needs its own kernel source, its own
+Objective-C++ bridge, and its own parity test against the CPU reference, rather
+than a recompile of what is already there.
+
 ### The offline harness
 
 `masktest` links the same `src/core` the plugin does, with no host in the loop.
@@ -179,6 +229,8 @@ here a guess costs a second and inside Resolve it costs a relaunch.
 ```bash
 build\Release\masktest.exe tests\data\three_shapes.png out.png --diag
 ```
+
+On macOS the same thing, at `build/Release/masktest`.
 
 `--diag` false-colours the label image and dots each element's seed pixel, so
 "did that split correctly" is a glance rather than an inference. `--stats`
